@@ -280,3 +280,13 @@ The integer decimation (factor 6) produced 7350Hz audio, causing a ~1.7ms timing
 4. Accumulate into 160-sample frame buffer
 
 ---
+
+## [Unreleased / Detected] - 2026-01-12
+
+### Critical Issues
+- **DSP Buffer Overflow Risk**: `DSPProcessor.h` sizing mismatch. State buffers allocated for 128 samples, but DSP initialized for 160 samples (Lines 42-43 vs Line 8). Potential memory corruption.
+- **Hardcoded Credentials**: WiFi SSID/Password hardcoded in `main.cpp` (Line 542).
+
+### Identified Technical Debt
+- **Missing Fallback**: No logic for GPS loss (sends timestamp 0).
+- **Web Interface**: `WebInterface.cpp` is a skeleton/stub.
