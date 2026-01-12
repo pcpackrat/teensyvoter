@@ -1,0 +1,20 @@
+Signal,Source Component,Source Pin,Destination Component,Destination Pin,Notes
+Power,Teensy 4.1,USB/VIN,All Modules,3.3V (or as required),Common GND required; use 3.3V regulator for ESP32
+GND,Teensy 4.1,GND,All Modules,GND,Common ground
+GPS TX,GPS GT-UT,TX,GPS -> Teensy,RX1 (pin 0),GPS -> Teensy Serial1 RX
+GPS RX,GPS GT-UT,RX,GPS -> Teensy,TX1 (pin 1),Optional (only if configuring GPS)
+GPS PPS,GPS GT-UT,PPS,GPS -> Teensy,D2 (pin 2),Attach to `PPS_PIN`
+GPS VCC,GPS GT-UT,VCC,Power,3.3V or module-specified,Vcc must be compatible; use level shifting if 5V
+ESP32 MISO,ESP32 WROOM,MISO,ESP32 -> Teensy,MISO (pin 12),Hardware SPI MISO
+ESP32 MOSI,ESP32 WROOM,MOSI,ESP32 -> Teensy,MOSI (pin 11),Hardware SPI MOSI
+ESP32 SCK,ESP32 WROOM,SCK,ESP32 -> Teensy,SCK (pin 13),Hardware SPI SCK
+ESP32 CS,ESP32 WROOM,CS,ESP32 -> Teensy,D10 (pin 10),Chip select; driver constructed with CS=10
+ESP32 READY,ESP32 WROOM,READY,ESP32 -> Teensy,D24 (pin 24),Module "ready/interrupt" line
+ESP32 RESET,Teensy,D25,ESP32 -> RESET (EN/RST),D25 (pin 25),Teensy drives ESP reset
+ESP32 VCC,ESP32 WROOM,VCC,Power,3.3V regulator output,Use dedicated 3.3V regulator >=800mA
+ESP32 GND,ESP32 WROOM,GND,Power,GND,Common ground
+Audio Shield,Teensy 4.1,Header,Audio Shield,Header,Audio Shield Rev D plugs directly onto Teensy headers
+RSSI out,External RSSI Divider,OUT,RSSI -> Teensy,A14 (analog A14),Max 3.3V
+Debug Pulse,Teensy 4.1,D3 (PIN_DEBUG_TX),Oscilloscope,Probe,D3,SCOPE trigger around audio send
+I2C SDA,Audio Shield/SGTL5000,SDA,Teensy,SDA (on I2C pins),Used by SGTL5000 control (if breakout used)
+I2C SCL,Audio Shield/SGTL5000,SCL,Teensy,SCL (on I2C pins),Used by SGTL5000 control (if breakout used)

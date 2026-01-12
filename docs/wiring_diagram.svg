@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="420" viewBox="0 0 800 420">
+  <style>text{font-family:Arial,Helvetica,sans-serif;font-size:12px}</style>
+  <!-- Background -->
+  <rect x="0" y="0" width="800" height="420" fill="#fff"/>
+  <!-- Teensy block -->
+  <rect x="300" y="40" width="200" height="340" rx="8" fill="#e8f4ff" stroke="#0066cc" />
+  <text x="400" y="62" font-weight="700" text-anchor="middle">Teensy 4.1</text>
+
+  <!-- Teensy pins (left) -->
+  <text x="290" y="95">0 RX1</text>
+  <text x="290" y="125">1 TX1</text>
+  <text x="290" y="155">2 PPS</text>
+  <text x="290" y="185">3 DEBUG</text>
+  <text x="290" y="215">10 CS</text>
+  <text x="290" y="245">11 MOSI</text>
+  <text x="290" y="275">12 MISO</text>
+  <text x="290" y="305">13 SCK</text>
+  <text x="290" y="335">A14 (RSSI)</text>
+  <text x="290" y="365">24 READY</text>
+  <text x="290" y="395">25 RESET</text>
+
+  <!-- GPS module -->
+  <rect x="70" y="60" width="160" height="120" rx="6" fill="#fff8e1" stroke="#e68a00"/>
+  <text x="150" y="80" font-weight="700" text-anchor="middle">GPS GT-UT</text>
+  <text x="120" y="105">TX -> Teensy 0 (RX1)</text>
+  <text x="120" y="125">RX -> Teensy 1 (TX1) (opt)</text>
+  <text x="120" y="145">PPS -> Teensy 2</text>
+  <text x="120" y="165">VCC -> 3.3V</text>
+  <text x="120" y="185">GND -> GND</text>
+
+  <!-- ESP32 module -->
+  <rect x="70" y="220" width="200" height="140" rx="6" fill="#e8ffe8" stroke="#1e8b00"/>
+  <text x="170" y="240" font-weight="700" text-anchor="middle">ESP32 WROOM (SPI Co-Processor)</text>
+  <text x="120" y="265">MISO -> Teensy 12</text>
+  <text x="120" y="285">MOSI -> Teensy 11</text>
+  <text x="120" y="305">SCK  -> Teensy 13</text>
+  <text x="120" y="325">CS   -> Teensy 10</text>
+  <text x="120" y="345">READY-> Teensy 24</text>
+  <text x="120" y="365">RESET-> Teensy 25</text>
+  <text x="120" y="385">VCC  -> 3.3V regulator</text>
+
+  <!-- Audio Shield (top) -->
+  <rect x="340" y="6" width="120" height="28" rx="4" fill="#f2f2f2" stroke="#999"/>
+  <text x="400" y="24" text-anchor="middle">Audio Shield Rev D (plugs on Teensy)</text>
+
+  <!-- RSSI and Debug probes -->
+  <text x="520" y="140">A14 <- RSSI voltage divider (0-3.3V)</text>
+  <text x="520" y="160">D3 -> Debug scope probe (TX trigger)</text>
+
+  <!-- Power rails -->
+  <text x="520" y="200">3.3V regulator -> ESP32 VCC (>=800mA)</text>
+  <text x="520" y="220">All GND -> common GND</text>
+
+
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0 10 3.5 0 7" fill="#444" />
+    </marker>
+  </defs>
+
+  <!-- Connector lines (simplified) -->
+  <line x1="230" y1="95" x2="300" y2="95" stroke="#444" stroke-width="1" marker-end="url(#arrow)" />
+  <line x1="230" y1="125" x2="300" y2="125" stroke="#444" stroke-width="1" marker-end="url(#arrow)" />
+  <line x1="230" y1="155" x2="300" y2="155" stroke="#444" stroke-width="1" marker-end="url(#arrow)" />
+  <line x1="230" y1="185" x2="300" y2="185" stroke="#444" stroke-width="1" marker-end="url(#arrow)" />
+
+  <text x="400" y="410" font-size="11" text-anchor="middle">Refer to docs/wiring_pin_table.csv for exact pin mapping.</text>
+</svg>
