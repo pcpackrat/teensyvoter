@@ -643,57 +643,62 @@ void loop() {
       (void)analogVal;
     }
 
-    // 2. CMSIS FIR Decimation (44.1kHz -> ~7.35kHz)
-    // Simple single-pole IIR low-pass at ~3.4kHz to prevent aliasing
-    // when decimating 44.1kHz → 8kHz (Nyquist = 4kHz)
-    // Alpha = 2*pi*fc / (2*pi*fc + fs) where fc=3400, fs=44117.6
-    // const float alpha = 0.327f; // Pre-calculated for 3.4kHz @ 44.1kHz
+    // 2. Fractional Resampling (44.1kHz -> 8000Hz)
+    // Fixes timing drift (Pulsing) caused by integer decimation
+    const float RESAMPLE_RATIO = AUDIO_SAMPLE_RATE_EXACT / 8000.0f; // ~5.5147
 
-    // A. Buffer the new 128 samples (convert to float)
-    // CRITICAL FIX: Only read 128 samples (Teensy Audio block size), not
-    // AUDIO_BLOCK_SAMPLES (160)
+    // State variables (static to persist across blocks)
+    static float resamplePos =
+        0.0f; // Next output time relative to current block start
+    static float lastFilteredSample =
+        0.0f; // Previous input sample (y[i-1]) for interpolation
+
+    // Simple Anti-Aliasing Filter State
+    static float lpfState = 0.0f;
+    const float lpfAlpha = 0.15f; // ~3kHz cutoff (Approx)
+
+    // Process all 128 input samples
     for (int i = 0; i < 128; i++) {
-      if (decimatorInputLen < 256) {
-        decimatorInputBuf[decimatorInputLen++] = (float)buff[i];
-      }
-    }
+      // A. Anti-Aliasing (IIR LPF)
+      float in = (float)buff[i];
+      lpfState += lpfAlpha * (in - lpfState);
+      float currentSample = lpfState;
 
-    // Free the Audio Library buffer immediately
-    recordQueue.freeBuffer();
+      // B. Generate Output Samples via Linear Interpolation
+      // We generate an output whenever 'resamplePos' falls within the interval
+      // (i-1, i] i.e., while resamplePos < i
 
-    // B. Process chunks divisible by DECIMATION_FACTOR (6)
-    int numOutputSamples = decimatorInputLen / DECIMATION_FACTOR;
-    int numSamplesToProcess = numOutputSamples * DECIMATION_FACTOR;
+      while (resamplePos < (float)i) {
+        // Calculate interpolation fraction
+        // Interval is [i-1, i]. currentSample is at i. lastFilteredSample is at
+        // i-1. Fraction from i-1:
+        float frac = resamplePos - ((float)i - 1.0f);
 
-    if (numSamplesToProcess > 0) {
-      float outputFloatBuf[64]; // Max output (~42)
+        float out =
+            lastFilteredSample + frac * (currentSample - lastFilteredSample);
 
-      // Run CMSIS Decimator
-      // blockSize argument is NUMBER OF INPUT SAMPLES
-      arm_fir_decimate_f32(&decimator, decimatorInputBuf, outputFloatBuf,
-                           numSamplesToProcess);
+        // Clip and Store to Accumulation Buffer
+        if (out > 32760.0f)
+          out = 32760.0f;
+        if (out < -32760.0f)
+          out = -32760.0f;
 
-      // C. Store to accumulation buffer (converted back to int16)
-      for (int i = 0; i < numOutputSamples; i++) {
         if (accHead < 512) {
-          // Clip and Store
-          float val = outputFloatBuf[i];
-          if (val > 32760.0f)
-            val = 32760.0f;
-          if (val < -32760.0f)
-            val = -32760.0f;
-          accumulationBuf[accHead++] = (int16_t)val;
+          accumulationBuf[accHead++] = (int16_t)out;
         }
+
+        // Advance target time for next output
+        resamplePos += RESAMPLE_RATIO;
       }
 
-      // D. Move remaining input samples to front
-      int remaining = decimatorInputLen - numSamplesToProcess;
-      if (remaining > 0) {
-        memmove(decimatorInputBuf, &decimatorInputBuf[numSamplesToProcess],
-                remaining * sizeof(float));
-      }
-      decimatorInputLen = remaining;
+      lastFilteredSample = currentSample;
     }
+
+    // Adjust resamplePos for next block (subtract 128 input samples)
+    resamplePos -= 128.0f;
+
+    // Free the Audio Library buffer
+    recordQueue.freeBuffer();
 
     // 3. Check if we have enough for a Frame (160 samples)
     // 3. Check if we have enough for a Frame (160 samples)

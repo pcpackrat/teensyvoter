@@ -265,18 +265,18 @@ Replace simple averaging with proper `arm_fir_decimate_f32()`:
 - Eliminates rhythmic pulse artifacts
 - Matches professional DSP approach
 
-**Status**: Implemented CMSIS FIR decimator (Option 1).
+**Status**: Implemented Fractional Resampler (Linear Interpolation).
 
-**CRITICAL BUG FOUND & FIXED:**
-During implementation, discovered that the original decimation loop was iterating up to `AUDIO_BLOCK_SAMPLES` (160) while reading from the Teensy Audio buffer which is only **128 samples**.
-- **Impact**: We were reading **32 samples of garbage memory** every frame.
-- **Result**: This likely caused the "mechanical" artifacts, random glitches, and potentially the rhythmic noise.
-- **Fix**: New CMSIS implementation strictly processes only the valid 128 input samples.
+**CRITICAL TIMING FIX:**
+The integer decimation (factor 6) produced 7350Hz audio, causing a ~1.7ms timing drift per packet relative to the 8000Hz target. This caused cyclical buffer underruns ("pulsing").
+- **Fix**: Replaced integer decimation with **Fractional Resampling** (Ratio ~5.5147).
+- **Technique**: Anti-aliasing LPF + Linear Interpolation.
+- **Result**: Exact 8000Hz timing, eliminating drift and pulsing.
 
 **New Signal Flow:**
 1. Buffer 128 input samples
-2. Decimate by factor 6 using `arm_fir_decimate_f32` (CMSIS DSP)
-3. Accumulate into 160-sample frame buffer
-4. Apply existing filters (PL, De-emphasis)
+2. Apply Low-Pass Filter (Anti-Aliasing)
+3. Resample 44.1kHz -> 8kHz using Linear Interpolation
+4. Accumulate into 160-sample frame buffer
 
 ---
