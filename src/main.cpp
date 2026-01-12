@@ -581,10 +581,14 @@ void setup() {
     decimatorCoeffs[i] = 1.0f / (float)DECIMATOR_NUM_TAPS;
   }
 
-  if (arm_fir_decimate_init_f32(
-          &decimator, DECIMATOR_NUM_TAPS, DECIMATION_FACTOR, decimatorCoeffs,
-          decimatorState, AUDIO_BLOCK_SAMPLES) != ARM_MATH_SUCCESS) {
-    Serial.println("ERROR: Decimator Init Failed!");
+  // Use a safe input block size (multiple of M=6) for Init check. 120 is safe.
+  arm_status status = arm_fir_decimate_init_f32(
+      &decimator, DECIMATOR_NUM_TAPS, DECIMATION_FACTOR, decimatorCoeffs,
+      decimatorState, 120);
+
+  if (status != ARM_MATH_SUCCESS) {
+    Serial.print("ERROR: Decimator Init Failed! Code: ");
+    Serial.println(status);
   }
 
   // 7. Web
@@ -665,9 +669,9 @@ void loop() {
       float outputFloatBuf[64]; // Max output (~42)
 
       // Run CMSIS Decimator
-      // blockSize argument is NUMBER OF OUTPUT SAMPLES
+      // blockSize argument is NUMBER OF INPUT SAMPLES
       arm_fir_decimate_f32(&decimator, decimatorInputBuf, outputFloatBuf,
-                           numOutputSamples);
+                           numSamplesToProcess);
 
       // C. Store to accumulation buffer (converted back to int16)
       for (int i = 0; i < numOutputSamples; i++) {
