@@ -248,27 +248,35 @@ void VoterClient::processAudioFrame(uint8_t *ulawData, uint8_t rssi,
   static VTIME prevFrameTime = {0, 0};
   static bool firstFrame = true;
 
+  // Use DEAD RECKONING for timestamps
+  // To avoid jitter from the main loop or GPS polling affecting the stream
+  // continuity, we strictly increment the timestamp by 20ms for every frame.
+
   if (_gps && _gps->isLocked()) {
     if (firstFrame) {
-      // First packet: use current frame time
+      // Sync to GPS time initially
+      // Apply 100ms backdate to match system latency profile
       prevFrameTime = frameTime;
+      if (prevFrameTime.vtime_nsec >= 100000000) {
+        prevFrameTime.vtime_nsec -= 100000000;
+      } else {
+        prevFrameTime.vtime_sec--;
+        prevFrameTime.vtime_nsec += 900000000;
+      }
       firstFrame = false;
-    }
-
-    // Use previous frame's timestamp for THIS packet
-    pkt.header.curtime = prevFrameTime;
-
-    // Store current frame time for NEXT packet (with 100ms backdate)
-    VTIME backdatedTime = frameTime;
-    if (backdatedTime.vtime_nsec >= 100000000) {
-      backdatedTime.vtime_nsec -= 100000000;
     } else {
-      backdatedTime.vtime_sec--;
-      backdatedTime.vtime_nsec += 900000000; // 1s - 100ms
+      // Increment by exactly 20ms (20,000,000 ns)
+      prevFrameTime.vtime_nsec += 20000000;
+      if (prevFrameTime.vtime_nsec >= 1000000000) {
+        prevFrameTime.vtime_sec++;
+        prevFrameTime.vtime_nsec -= 1000000000;
+      }
     }
-    prevFrameTime = backdatedTime;
+
+    // Use this perfect time
+    pkt.header.curtime = prevFrameTime;
   } else {
-    // Fallback or Mix Mode Logic (Unimplemented for now)
+    // Fallback
     pkt.header.curtime.vtime_sec = 0;
   }
 

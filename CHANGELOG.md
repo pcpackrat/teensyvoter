@@ -265,18 +265,24 @@ Replace simple averaging with proper `arm_fir_decimate_f32()`:
 - Eliminates rhythmic pulse artifacts
 - Matches professional DSP approach
 
-**Status**: Implemented Fractional Resampler (Linear Interpolation).
+**Status**: Implemented Fractional Resampler + Dead Reckoning Timestamps.
 
-**CRITICAL TIMING FIX:**
-The integer decimation (factor 6) produced 7350Hz audio, causing a ~1.7ms timing drift per packet relative to the 8000Hz target. This caused cyclical buffer underruns ("pulsing").
-- **Fix**: Replaced integer decimation with **Fractional Resampling** (Ratio ~5.5147).
-- **Technique**: Anti-aliasing LPF + Linear Interpolation.
-- **Result**: Exact 8000Hz timing, eliminating drift and pulsing.
+**CRITICAL FIXES:**
+1. **Timing Drift (Pulsing)**:
+   - **Root Cause**: Two-fold. (1) Sample rate drift (Fixed by Resampler). (2) Timestamp Jitter. Packets were timestamped with "Capture Time", which jitters by milliseconds. Server buffer couldn't handle this variance.
+   - **Fix**: Implemented **Dead Reckoning**. Initial Frame = GPS Time. Subsequent Frames = Previous + 20ms (Exactly).
+   - **Result**: Perfect continuous timestamp stream.
 
-**New Signal Flow:**
+2. **Audio Quality ("Muffled/2000s")**:
+   - **Root Cause**: Anti-Aliasing LPF was cut off at ~1kHz (Alpha 0.15).
+   - **Fix**: Increased LPF cutoff to ~3kHz (Alpha 0.42).
+   - **Result**: Clearer voice audio.
+
+**Signal Flow:**
 1. Buffer 128 input samples
-2. Apply Low-Pass Filter (Anti-Aliasing)
-3. Resample 44.1kHz -> 8kHz using Linear Interpolation
-4. Accumulate into 160-sample frame buffer
+2. LPF (3kHz)
+3. Resample (Linear Interpolation) 44.1k -> 8k
+4. Accumulate
+5. Packetize with Dead Reckoning Timestamp
 
 ---
