@@ -43,6 +43,8 @@ float g_testTonePhase = 0.0f;
 arm_fir_decimate_instance_f32 decimator;
 float decimatorState[AUDIO_BLOCK_SAMPLES + DECIMATOR_NUM_TAPS - 1];
 float decimatorCoeffs[DECIMATOR_NUM_TAPS];
+float decimatorInputBuf[256];
+int decimatorInputLen = 0;
 
 // Buffer for 8kHz downsampled audio
 int16_t accumulationBuf[512]; // Circular-ish buffer for outgoing samples
@@ -98,11 +100,16 @@ void resetAudioState() {
   // dsp.reset(); // If DSP class has reset
 
   // Reset decimation
-  g_avgSum = 0.0f;
-  g_avgCount = 0;
   accHead = 0;
-  samplePosition = 0.0f;
   g_testTonePhase = 0.0f;
+
+  // Clear Decimator State (Filter History)
+  // This resets the internal state of the CMSIS filter
+  memset(decimatorState, 0, sizeof(decimatorState));
+
+  // Clear Input Buffer
+  decimatorInputLen = 0;
+  // memset(decimatorInputBuf, 0, sizeof(decimatorInputBuf)); // Optional
 
   memset(accumulationBuf, 0, sizeof(accumulationBuf));
   recordQueue.clear();
@@ -637,8 +644,6 @@ void loop() {
     // when decimating 44.1kHz → 8kHz (Nyquist = 4kHz)
     // Alpha = 2*pi*fc / (2*pi*fc + fs) where fc=3400, fs=44117.6
     // const float alpha = 0.327f; // Pre-calculated for 3.4kHz @ 44.1kHz
-    static float decimatorInputBuf[256];
-    static int decimatorInputLen = 0;
 
     // A. Buffer the new 128 samples (convert to float)
     // CRITICAL FIX: Only read 128 samples (Teensy Audio block size), not
