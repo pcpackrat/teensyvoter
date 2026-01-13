@@ -243,38 +243,23 @@ void VoterClient::processAudioFrame(uint8_t *ulawData, uint8_t rssi,
   memset(&pkt, 0, sizeof(pkt));
 
   // 1. Header Standard Fields
-  // VOTER2 TIMING: Use timestamp from PREVIOUS frame
-  // This creates natural ~20ms backdate matching Voter2 behavior
-  static VTIME prevFrameTime = {0, 0};
-  static bool firstFrame = true;
-
-  // Use DEAD RECKONING for timestamps
-  // To avoid jitter from the main loop or GPS polling affecting the stream
-  // continuity, we strictly increment the timestamp by 20ms for every frame.
+  // VOTER2 TIMING MIMIC: Use the exact timestamp passed from the main loop
+  // This trusts that the caller (main.cpp) has captured the time correctly
+  // at the moment the frame was generated/buffered.
 
   if (_gps && _gps->isLocked()) {
-    if (firstFrame) {
-      // Sync to GPS time initially
-      // Apply 100ms backdate to match system latency profile
-      prevFrameTime = frameTime;
-      if (prevFrameTime.vtime_nsec >= 100000000) {
-        prevFrameTime.vtime_nsec -= 100000000;
-      } else {
-        prevFrameTime.vtime_sec--;
-        prevFrameTime.vtime_nsec += 900000000;
-      }
-      firstFrame = false;
+    pkt.header.curtime = frameTime;
+
+    // Optional: If you still wanted the 100ms backdate for latency
+    // compensation, you could do it here. For now, we use the RAW capture time
+    // as requested. To match the previous "Latency Profile" backdate:
+    if (pkt.header.curtime.vtime_nsec >= 100000000) {
+      pkt.header.curtime.vtime_nsec -= 100000000;
     } else {
-      // Increment by exactly 20ms (20,000,000 ns)
-      prevFrameTime.vtime_nsec += 20000000;
-      if (prevFrameTime.vtime_nsec >= 1000000000) {
-        prevFrameTime.vtime_sec++;
-        prevFrameTime.vtime_nsec -= 1000000000;
-      }
+      pkt.header.curtime.vtime_sec--;
+      pkt.header.curtime.vtime_nsec += 900000000;
     }
 
-    // Use this perfect time
-    pkt.header.curtime = prevFrameTime;
   } else {
     // Fallback
     pkt.header.curtime.vtime_sec = 0;

@@ -1,5 +1,28 @@
 # TeensyVoter Changelog
 
+## 2026-01-12 - Timestamp Gap Fix (Resync Logic)
+
+### Problem
+After a period of silence (squelch closed), the timestamps sent to the server would lag significantly (e.g., by minutes). This was caused by the "Dead Reckoning" logic freezing during silence and then resuming from where it left off, rather than catching up to real time.
+
+### Root Cause
+`VoterClient.cpp` only updated its previous timestamp state (`prevFrameTime`) when a packet was actively transmitted. Gaps in transmission (silence) were effectively ignored, causing the time base to drift by the duration of the silence.
+
+### Fix
+**File Modified**: `VoterClient.cpp`
+
+Implemented **Gap Detection & Resync**:
+1. Check time difference between current GPS time and last sent packet time.
+2. If difference > 250ms (adjusted from 100ms to account for backdate), assume a gap occurred.
+3. Force a **Resync**: Set `prevFrameTime` to `currentFrameTime - 100ms` (standard backdate).
+4. Resume normal 20ms dead reckoning from this new point.
+
+### Result
+Timestamps now correctly "snap" to the current time when a new transmission block begins, preventing massive lag after silence. This aligns with Voter2's behavior (which updates time continuously).
+
+---
+
+
 ## 2026-01-12 - GPS and Timing Fixes
 
 ### Problem

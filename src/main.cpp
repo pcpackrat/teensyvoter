@@ -793,9 +793,16 @@ void loop() {
       if (g_noSignalMode)
         finalRSSI = 0;
 
-      // Send Packet with captured timestamp (only if signal is active)
-      if (finalRSSI > 0) {
+      bool shouldSend = (finalRSSI > 0);
+      if (shouldSend) {
+        // Use the proper client method which handles sequence, timestamp, and
+        // sending
+        VTIME frameTime = {0, 0};
+        if (gpsMgr.isLocked()) {
+          gpsMgr.getNetworkTime(&frameTime);
+        }
         voter.processAudioFrame(ulawFrame, finalRSSI, frameTime);
+        // Serial.println("[Test] Generated Audio Frame (Not Sent)");
       }
 
       // Move remaining

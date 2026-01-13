@@ -48,4 +48,11 @@ python -m platformio device monitor -p COM9 -b 115200
    - Do not feed >3.3V signals into Teensy GPIO pins.
    - Double-check regulator connections before powering heavy modules.
 
-If you want, I can: (A) export these three docs as a ZIP, (B) generate a PNG of the SVG, or (C) produce a printable PDF checklist. Which would you like next?
+10. Verify Timestamp Fix (New)
+    - **Goal**: Ensure timestamps do not lag by minutes after silence.
+    - **Method**:
+        1. Allow GPS to lock.
+        2. Transmit audio for ~10 seconds.
+        3. stop transmitting (silence) for > 1 minute.
+        4. Resume transmission.
+    - **Check**: Server logs should show a small `diff` (e.g., +20ms to +200ms). If `diff` jumps to huge values (e.g., > 10,000,000,000 ns or 10s+), the fix is NOT working.
