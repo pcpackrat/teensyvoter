@@ -3,7 +3,7 @@
 > **DO NOT DELETE**. This file represents the "Brain" of the project for AI Assistants. Read this first when starting a new session.
 
 ## Current State (Jan 12 2026)
-- **Status**: Stable Audio Path, Critical Bug in DSP Buffer Sizing.
+- **Status**: Unstable Audio Path, Critical Bug in DSP
 - **Hardware**: Teensy 4.1 + SGTL5000 + Standard GPS (PPS).
 - **Core Feature**: Fractional Resampling (44.1k -> 8k) is implemented and fixes timing drift (pulsing).
 - **Protocol**: Voter Protocol (Cisco/Motorola) over UDP.
