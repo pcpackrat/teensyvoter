@@ -655,7 +655,8 @@ void loop() {
 
     // Simple Anti-Aliasing Filter State
     static float lpfState = 0.0f;
-    const float lpfAlpha = 0.15f; // ~3kHz cutoff (Approx)
+    const float lpfAlpha =
+        0.42f; // ~3kHz cutoff (fc = 3000, fs = 44100 -> alpha ~ 0.42)
 
     // Process all 128 input samples
     for (int i = 0; i < 128; i++) {
