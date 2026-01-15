@@ -609,10 +609,9 @@ void loop() {
 
   // 2. Audio Processing Loop
   // Changed to 'if' to prevent starvation of GPS/Network if DSP is slow
-  // We process up to 2 blocks per loop to catch up if needed, but yield to
-  // other tasks
+  // We process up to 8 blocks per loop to ensure we drain the queue
   int blocksProcessed = 0;
-  while (recordQueue.available() >= 1 && blocksProcessed < 2) {
+  while (recordQueue.available() >= 1 && blocksProcessed < 8) {
     blocksProcessed++;
     int16_t *buff = recordQueue.readBuffer();
     if (!buff)
@@ -622,6 +621,8 @@ void loop() {
     // We only process Decimated 8kHz Audio (160 Samples).
     // Processing here caused 44.1kHz aliasing issues.
 
+    // 3. Check if we have enough for a Frame (160 samples)
+    // 3. Inject Test Tone if enabled (Overwrites Mic Data in 'buff')
     if (g_testToneMode) {
       // Use global phase for consistency across blocks & reset capability
       const float freq = 1000.0f;                       // 1kHz
@@ -629,7 +630,7 @@ void loop() {
       const float amplitude = 5000.0f;
       const float phaseIncrement = 2.0f * 3.14159265f * freq / sampleRate;
 
-      for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
+      for (int i = 0; i < 128; i++) {
         buff[i] = (int16_t)(amplitude * sinf(g_testTonePhase));
         g_testTonePhase += phaseIncrement;
         if (g_testTonePhase >= 2.0f * 3.14159265f)
@@ -648,15 +649,12 @@ void loop() {
     const float RESAMPLE_RATIO = AUDIO_SAMPLE_RATE_EXACT / 8000.0f; // ~5.5147
 
     // State variables (static to persist across blocks)
-    static float resamplePos =
-        0.0f; // Next output time relative to current block start
-    static float lastFilteredSample =
-        0.0f; // Previous input sample (y[i-1]) for interpolation
+    static float resamplePos = 0.0f;
+    static float lastFilteredSample = 0.0f;
 
     // Simple Anti-Aliasing Filter State
     static float lpfState = 0.0f;
-    const float lpfAlpha =
-        0.42f; // ~3kHz cutoff (fc = 3000, fs = 44100 -> alpha ~ 0.42)
+    const float lpfAlpha = 0.42f;
 
     // Process all 128 input samples
     for (int i = 0; i < 128; i++) {
@@ -666,15 +664,8 @@ void loop() {
       float currentSample = lpfState;
 
       // B. Generate Output Samples via Linear Interpolation
-      // We generate an output whenever 'resamplePos' falls within the interval
-      // (i-1, i] i.e., while resamplePos < i
-
       while (resamplePos < (float)i) {
-        // Calculate interpolation fraction
-        // Interval is [i-1, i]. currentSample is at i. lastFilteredSample is at
-        // i-1. Fraction from i-1:
         float frac = resamplePos - ((float)i - 1.0f);
-
         float out =
             lastFilteredSample + frac * (currentSample - lastFilteredSample);
 
@@ -793,13 +784,43 @@ void loop() {
       if (g_noSignalMode)
         finalRSSI = 0;
 
+      // FORCE Test Tone to send
+      if (g_testToneMode) {
+        finalRSSI = 255;
+      }
+
       bool shouldSend = (finalRSSI > 0);
       if (shouldSend) {
         // Use the proper client method which handles sequence, timestamp, and
         // sending
         VTIME frameTime = {0, 0};
         if (gpsMgr.isLocked()) {
-          gpsMgr.getNetworkTime(&frameTime);
+          // STRICT FRAME COUNTING STRATEGY
+          // Decouples timestamp from micros() jitter/phase drift.
+          static uint32_t lastEpoch = 0;
+          static uint32_t framesSent = 0;
+
+          uint32_t currentEpoch = gpsMgr.getEpoch();
+
+          if (currentEpoch != lastEpoch) {
+            lastEpoch = currentEpoch;
+            framesSent = 0;
+          }
+
+          // Basic Ideal Timestamp
+          frameTime.vtime_sec = currentEpoch;
+          frameTime.vtime_nsec = framesSent * 20000000; // 20ms in ns
+          framesSent++;
+
+          // Offset Logic (Maintained from previous step)
+          uint32_t delayNs = 180000000; // 180ms
+          if (frameTime.vtime_nsec >= delayNs) {
+            frameTime.vtime_nsec -= delayNs;
+          } else {
+            frameTime.vtime_sec--;
+            frameTime.vtime_nsec =
+                (1000000000 + frameTime.vtime_nsec) - delayNs;
+          }
         }
         voter.processAudioFrame(ulawFrame, finalRSSI, frameTime);
         // Serial.println("[Test] Generated Audio Frame (Not Sent)");

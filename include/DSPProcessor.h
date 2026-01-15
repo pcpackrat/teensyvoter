@@ -1,6 +1,7 @@
 #ifndef DSP_PROCESSOR_H
 #define DSP_PROCESSOR_H
 
+#include "VoiceFilter.h"
 #include <Arduino.h>
 #include <arm_math.h>
 
@@ -31,16 +32,16 @@ public:
 private:
   // FIR Filter instances
   arm_fir_instance_f32 _rssiFilter;
-  arm_fir_instance_f32 _voiceFilter;
+  // arm_fir_instance_f32 _voiceFilter; // Replaced by _intVoiceFilter
 
   // Coefficients (Converted to Float)
   float _rssiCoeffs[24]; // 23 taps + 1 for alignment if needed, but f32 doesn't
                          // need align
-  float _voiceCoeffs[64];
-
   // State Buffers (Block Size + NumTaps - 1)
   float _rssiState[128 + 24];
-  float _voiceState[128 + 64];
+
+  // Integer Voice Filter
+  VoiceFilter _intVoiceFilter;
 
   // Biquad HPF (300Hz)
   arm_biquad_casd_df1_inst_f32 _hpf;

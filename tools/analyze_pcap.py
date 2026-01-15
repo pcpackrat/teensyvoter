@@ -104,5 +104,10 @@ def parse_pcap(filepath):
         print(f"An error occurred: {e}")
 
 if __name__ == "__main__":
-    print("--- Analyzing DUPLICATE Trace ---")
-    parse_pcap(r"c:\Users\mikec\Documents\Projects\VOTER\TeensyVoter\traces\duplicate_trace.pcap")
+    if len(sys.argv) > 1:
+        target_file = sys.argv[1]
+    else:
+        target_file = r"c:\Users\mikec\Documents\Projects\VOTER\TeensyVoter\traces\duplicate_trace.pcap"
+        
+    print(f"--- Analyzing {target_file} ---")
+    parse_pcap(target_file)

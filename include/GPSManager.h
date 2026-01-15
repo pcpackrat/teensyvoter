@@ -21,7 +21,12 @@ public:
 
   // Time Retrieval
   // Fill the VTIME struct with the exact current network time
-  void getNetworkTime(VTIME *t);
+  // quantize: If true, snaps timestamp to nearest 20ms grid relative to PPS
+  // (removes jitter)
+  void getNetworkTime(VTIME *t, bool quantize = true);
+
+  // Return the current atomic epoch (safely reads _currentEpoch)
+  uint32_t getEpoch();
 
   // Debugging / Tuning
   uint32_t getPpsJitter(); // Returns jitter in micros from last second

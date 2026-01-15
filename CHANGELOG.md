@@ -1,5 +1,34 @@
 # TeensyVoter Changelog
 
+## 2026-01-13 - Strict Frame Counting (Final Jitter Fix)
+
+### Problem
+Audio stream had a persistent "4.5Hz pulsing" artifact (phase jitter) and negative diffs on the server.
+Previous attempts at "Ideal Time Quantization" solved the random jitter but left the phase drift.
+
+### Root Cause
+1.  **Phase Jitter**: Using `micros()` (even quantized) introduces subtle phase drift relative to the strict 20ms frame grid expected by the server.
+2.  **Timing Offset**: The Teensy's "Capture Time" logic naturally placed packets in the "Future" (-100ms diff) relative to the server's playout buffer expectation.
+
+### Fix
+**Files Modified**: `GPSManager.cpp`, `main.cpp`, `GPSManager.h`
+
+1.  **Strict Frame Counting**:
+    - Decoupled timestamps from `micros()` entirely.
+    - New Logic: `Timestamp = Epoch + (FrameCount * 20ms) - Offset`.
+    - Resets `FrameCount` to 0 on every new GPS Second (Epoch change).
+    - This guarantees mathematically perfect 20.000ms spacing with zero phase jitter.
+
+2.  **Buffer Offset (180ms)**:
+    - Retained the 180ms subtraction logic.
+    - This reliably shifts the perfect timestamps from the "Future" (-100ms) into the "Past" (+80ms).
+    - Ensures packets arrive "early enough" to build a healthy buffer on the server (Positive Diff).
+
+### Result
+- **Solid Tone**: Verified by user ("solid homie").
+- **No Pulsing**: 4.5Hz beat frequency eliminated.
+- **Stable Diffs**: Server logs show consistent positive timing.
+
 ## 2026-01-12 - Timestamp Gap Fix (Resync Logic)
 
 ### Problem

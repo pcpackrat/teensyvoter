@@ -243,28 +243,33 @@ void VoterClient::processAudioFrame(uint8_t *ulawData, uint8_t rssi,
   memset(&pkt, 0, sizeof(pkt));
 
   // 1. Header Standard Fields
-  // VOTER2 TIMING MIMIC: Use the exact timestamp passed from the main loop
-  // This trusts that the caller (main.cpp) has captured the time correctly
-  // at the moment the frame was generated/buffered.
+
+  // DEBUG: Monitor Jitter (Time since last call)
+  static uint32_t lastCall = 0;
+  uint32_t nowMs = millis();
+  uint32_t diff = nowMs - lastCall;
+  lastCall = nowMs;
+
+  if (diff > 25 || diff < 15) {
+    Serial.printf("[Jitter] Delta: %u ms (Target: 20ms)\r\n", diff);
+  }
 
   if (_gps && _gps->isLocked()) {
     pkt.header.curtime = frameTime;
+  } else {
+    // Fallback: Dead Reckoning (Simulated Time)
+    static uint32_t simSec = 10000; // Arbitrary start
+    static uint32_t simNsec = 0;
 
-    // Optional: If you still wanted the 100ms backdate for latency
-    // compensation, you could do it here. For now, we use the RAW capture time
-    // as requested. To match the previous "Latency Profile" backdate:
-    if (pkt.header.curtime.vtime_nsec >= 100000000) {
-      pkt.header.curtime.vtime_nsec -= 100000000;
-    } else {
-      pkt.header.curtime.vtime_sec--;
-      pkt.header.curtime.vtime_nsec += 900000000;
+    simNsec += 20000000; // +20ms
+    if (simNsec >= 1000000000) {
+      simNsec -= 1000000000;
+      simSec++;
     }
 
-  } else {
-    // Fallback
-    pkt.header.curtime.vtime_sec = 0;
+    pkt.header.curtime.vtime_sec = simSec;
+    pkt.header.curtime.vtime_nsec = simNsec;
   }
-
   // Network Byte Order for Time
   pkt.header.curtime.vtime_sec = my_htonl(pkt.header.curtime.vtime_sec);
   pkt.header.curtime.vtime_nsec = my_htonl(pkt.header.curtime.vtime_nsec);
@@ -278,12 +283,13 @@ void VoterClient::processAudioFrame(uint8_t *ulawData, uint8_t rssi,
   // pkt.audio is FRAME_SIZE (160 bytes)
   memcpy(pkt.audio, ulawData, FRAME_SIZE);
 
-  // Debug: Print RSSI value every 100 packets
-  // static int pktCount = 0;
-  // if (++pktCount >= 100) {
-  //   Serial.printf("[Voter] Sending Audio: RSSI=%u, Size=%u\r\n", pkt.rssi,
-  //   sizeof(pkt)); pktCount = 0;
-  // }
+  // Debug: Print RSSI value every 50 packets (1 second)
+  static int pktCount = 0;
+  if (++pktCount >= 50) {
+    Serial.printf("[Voter] Heartbeat: RSSI=%u JitterDelta=%u\r\n", pkt.rssi,
+                  diff);
+    pktCount = 0;
+  }
 
   // 3. Send
   _net->sendPacket((uint8_t *)&pkt, sizeof(pkt));

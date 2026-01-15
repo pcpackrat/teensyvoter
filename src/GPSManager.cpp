@@ -102,7 +102,7 @@ uint32_t GPSManager::getPpsJitter() {
   }
 }
 
-void GPSManager::getNetworkTime(VTIME *t) {
+void GPSManager::getNetworkTime(VTIME *t, bool quantize) {
   if (!t)
     return;
 
@@ -123,8 +123,28 @@ void GPSManager::getNetworkTime(VTIME *t) {
     deltaMicros %= 1000000;
   }
 
+  if (quantize) {
+    // SNAP to nearest 20ms grid (20000 micros)
+    // Add half-step (10000) for rounding
+    uint32_t slots = (deltaMicros + 10000) / 20000;
+    deltaMicros = slots * 20000;
+  }
+
+  // Handle potential overflow if rounding pushed us to 1000000
+  if (deltaMicros >= 1000000) {
+    epoch++;
+    deltaMicros -= 1000000;
+  }
+
   t->vtime_sec = epoch;
   t->vtime_nsec = deltaMicros * 1000; // Convert us to ns
+}
+
+uint32_t GPSManager::getEpoch() {
+  noInterrupts();
+  uint32_t e = _currentEpoch;
+  interrupts();
+  return e;
 }
 
 void GPSManager::getGPSStrings(char *lat, char *lon, char *elev) {

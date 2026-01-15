@@ -37,7 +37,7 @@ void EspSpiDriver::update() {
 void EspSpiDriver::sendPacket(const uint8_t *data, uint16_t len) {
   // Format: [CMD] [LEN_HI] [LEN_LO] [IP...4] [PORT...2] [DATA...]
 
-  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
 
   // Header
@@ -108,7 +108,7 @@ void EspSpiDriver::setCredentials(const char *ssid, const char *pass) {
 int EspSpiDriver::parsePacket() {
   // If ESP says "Ready", we read.
   if (digitalRead(_ready) == HIGH) {
-    SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+    SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
     digitalWrite(_cs, LOW);
 
     // We expect ESP to clock out: [STATUS] [LEN_HI] [LEN_LO] [DATA...]
@@ -161,7 +161,7 @@ IPAddress EspSpiDriver::getLocalIP() {
   // We need a raw "sendCommand" or just manually do it here.
 
   // Manual Command Send
-  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
   SPI.transfer(CMD_GET_IP);
   digitalWrite(_cs, HIGH);
