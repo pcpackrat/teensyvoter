@@ -7,49 +7,35 @@
 
 class EthernetDriver : public NetworkDriver {
 public:
-    bool begin(uint8_t* mac) override {
-        if (Ethernet.begin(mac) == 0) return false;
-        _udp.begin(0);
-        return true;
-    }
-    
-    void update() override {
-        Ethernet.maintain();
-    }
+  EthernetDriver();
+  virtual ~EthernetDriver() {}
 
-    bool isConnected() override {
-        return Ethernet.linkStatus() != LinkOFF;
-    }
+  // Init
+  virtual bool begin(uint8_t *mac) override; // DHCP mode
+  bool begin(uint8_t *mac, IPAddress ip, IPAddress subnet, IPAddress gateway,
+             IPAddress dns); // Static IP mode
+  virtual void update() override;
 
-    IPAddress getLocalIP() override {
-        return Ethernet.localIP();
-    }
+  // Status
+  virtual bool isConnected() override;
+  virtual IPAddress getLocalIP() override;
+  virtual DriverType getType() override { return DRIVER_ETHERNET; }
 
-    DriverType getType() override { return DRIVER_ETHERNET; }
+  // Data
+  virtual void setTarget(IPAddress ip, uint16_t port) override;
+  virtual void sendPacket(const uint8_t *data, uint16_t len) override;
+  virtual int parsePacket() override;
+  virtual int read(uint8_t *buffer, size_t maxLen) override;
 
-    void setTarget(IPAddress ip, uint16_t port) override {
-        _targetIP = ip;
-        _targetPort = port;
-    }
-
-    void sendPacket(const uint8_t* data, uint16_t len) override {
-        _udp.beginPacket(_targetIP, _targetPort);
-        _udp.write(data, len);
-        _udp.endPacket();
-    }
-
-    int parsePacket() override {
-        return _udp.parsePacket();
-    }
-
-    int read(uint8_t* buffer, size_t maxLen) override {
-        return _udp.read(buffer, maxLen);
-    }
+  // DNS Resolution
+  IPAddress resolveHostname(const char *hostname);
 
 private:
-    EthernetUDP _udp;
-    IPAddress _targetIP;
-    uint16_t _targetPort;
+  EthernetUDP _udp;
+  IPAddress _targetIP;
+  uint16_t _targetPort;
+  bool _linkStatus;
+  uint8_t *_mac;
 };
 
 #endif

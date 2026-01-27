@@ -40,7 +40,6 @@ void ConfigManager::resetDefaults() {
   data.mac[5] = 0xED;
 
   // Default Host: 10.10.10.42 : 667
-  data.hostname[0] = '\0'; // Empty hostname by default
   data.hostIP = (uint32_t)IPAddress(10, 10, 10, 42);
   data.hostPort = 1667;
 
@@ -48,14 +47,6 @@ void ConfigManager::resetDefaults() {
   strcpy(data.hostPwd, "K5LMA146980");
   strcpy(data.wifiSSID, "ImWatchinYou");
   strcpy(data.wifiPass, "n0Password");
-  data.dnsServerIP = 0; // Use DHCP default DNS
-
-  // Static IP Configuration (Ethernet)
-  data.useStaticIP = false;                              // Default to DHCP
-  data.staticIP = (uint32_t)IPAddress(192, 168, 1, 177); // Fallback IP
-  data.subnetMask = (uint32_t)IPAddress(255, 255, 255, 0);
-  data.gateway = (uint32_t)IPAddress(192, 168, 1, 1);
-  data.staticDNS = 0; // Use gateway as DNS
 
   data.useHwRSSI = true;  // Default to Hardware RSSI (ADC checked good)
   data.cosInvert = false; // Default: Active Low (Standard for Open Collector)
@@ -82,14 +73,3 @@ void ConfigManager::resetDefaults() {
 IPAddress ConfigManager::getHostIP() { return IPAddress(data.hostIP); }
 
 void ConfigManager::setHostIP(IPAddress ip) { data.hostIP = (uint32_t)ip; }
-
-const char *ConfigManager::getHostname() { return data.hostname; }
-
-void ConfigManager::setHostname(const char *hostname) {
-  if (hostname) {
-    strncpy(data.hostname, hostname, sizeof(data.hostname) - 1);
-    data.hostname[sizeof(data.hostname) - 1] = '\0'; // Ensure null termination
-  } else {
-    data.hostname[0] = '\0';
-  }
-}

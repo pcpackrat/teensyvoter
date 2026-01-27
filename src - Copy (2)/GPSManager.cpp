@@ -147,8 +147,6 @@ uint32_t GPSManager::getEpoch() {
   return e;
 }
 
-uint32_t GPSManager::getSatellites() { return _gpsParser.satellites.value(); }
-
 void GPSManager::getGPSStrings(char *lat, char *lon, char *elev) {
   if (lat) {
     // Format: DDMM.mmN

@@ -33,6 +33,7 @@ public:
 
   // Location
   void getGPSStrings(char *lat, char *lon, char *elev);
+  uint32_t getSatellites();
 
 private:
   Stream *_gpsSerial;

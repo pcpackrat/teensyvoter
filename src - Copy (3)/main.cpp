@@ -19,12 +19,11 @@
 #include "ConfigManager.h"
 #include "DSPProcessor.h"
 #include "EspSpiDriver.h"
-#include "EthernetDriver.h"
 #include "GPSManager.h"
 #include "NetworkManager.h"
 #include "VoterClient.h"
 #include "VoterProtocol.h"
-#include "WebServer.h"
+// #include "WebInterface.h" (Removed)
 
 #define RSSI_PIN A14 // Connect to voltage divider output (0-3.3V)
 #define COS_PIN 41   // Hardware COS input (active HIGH/LOW depending on radio)
@@ -38,7 +37,6 @@ float g_headphoneVol = 0.5f;
 uint16_t g_digitalGainPct = 100; // Default 100% (Unity)
 // bool g_noSignalMode = false;    // Removed
 bool g_testToneMode = false; // If true, send 1kHz test tone
-int g_forcedRSSI = -1;       // -1 = Disabled, 0-255 = Force Value
 float g_testTonePhase = 0.0f;
 // bool g_dspSilenceMode = false; // Removed
 // float g_postGain = 1.0f; // Default Post-Filter Gain (Removed)
@@ -95,14 +93,13 @@ AudioSynthWaveformSine sine1;
 AudioControlSGTL5000 sgtl5000_1;
 
 // --- Global Objects ---
-// Network Drivers (Auto-select: Ethernet first, fallback to WiFi)
-EthernetDriver ethDriver;
+// Select your Active Driver Here:
+// EthernetDriver ethDriver;
 EspSpiDriver spiDriver(26, 24, 25); // CS=26 (Uncovered), Ready=24, Reset=25
 NetworkManager netMgr;
-VoterClient voterClient;
-GPSManager gps;
+GPSManager gpsMgr;
+VoterClient voter;
 DSPProcessor dsp;
-WebServer webServer;
 // WebInterface web;
 ConfigManager cfg;
 
@@ -195,122 +192,68 @@ void setup() {
 
   Serial.println("[System] Boot Complete: Audio + Network + GPS");
 
-  // 3. Network - Auto-select: Try Ethernet first, fallback to WiFi
+  // 3. Network
   Serial.println("[System] Initializing Network Driver...");
+  // netMgr.begin(&ethDriver, mac);
+  netMgr.begin(&spiDriver, mac);
 
-  bool networkReady = false;
+  // Give ESP32 time to boot before sending credentials
+  Serial.println("[System] Waiting for ESP32 Boot (5s)...");
+  delay(5000); // Increased to 5s to match Spirit.ino startup delay
 
-  // Try Ethernet first
-  Serial.println("[Network] Attempting Ethernet (NativeEthernet)...");
+  // Send WiFi Credentials (Unconditional)
+  Serial.println("[System] Sending WiFi Credentials...");
+  spiDriver.setCredentials(cfg.data.wifiSSID, cfg.data.wifiPass);
 
-  bool ethSuccess = false;
-  if (cfg.data.useStaticIP) {
-    // Use static IP configuration
-    IPAddress staticIP(cfg.data.staticIP);
-    IPAddress subnet(cfg.data.subnetMask);
-    IPAddress gw(cfg.data.gateway);
-    IPAddress dns(cfg.data.staticDNS);
-    ethSuccess = ethDriver.begin(mac, staticIP, subnet, gw, dns);
-  } else {
-    // Use DHCP
-    ethSuccess = ethDriver.begin(mac);
-  }
+  // Wait for IP (up to 15s) with Audio Maintenance
+  Serial.print("[System] Waiting for WiFi Connection");
+  uint32_t waitStart = millis();
+  bool ipFound = false;
 
-  if (ethSuccess) {
-    Serial.println("[Network] ✓ Ethernet Connected!");
-    netMgr.begin(&ethDriver, mac);
-    networkReady = true;
-  } else {
-    Serial.println(
-        "[Network] ✗ Ethernet unavailable (no cable or DHCP failure)");
-
-    // Fallback to WiFi
-    Serial.println("[Network] Falling back to WiFi (ESP32 SPI)...");
-
-    // Give ESP32 time to boot
-    Serial.println("[System] Waiting for ESP32 Boot (5s)...");
-    delay(5000);
-
-    // Send WiFi Credentials
-    Serial.println("[System] Sending WiFi Credentials...");
-    spiDriver.setCredentials(cfg.data.wifiSSID, cfg.data.wifiPass);
-
-    // Initialize WiFi driver
-    if (spiDriver.begin(mac)) {
-      netMgr.begin(&spiDriver, mac);
-
-      // Wait for IP (up to 15s) with Audio Maintenance
-      Serial.print("[System] Waiting for WiFi Connection");
-      bool ipFound = false;
-      for (int i = 0; i < 30; i++) { // 30 * 500ms = 15 seconds
-        // Maintain Audio Queue (Prevent Overflow/Crash)
-        while (recordQueue.available() > 0) {
-          recordQueue.readBuffer();
-          recordQueue.freeBuffer();
-        }
-
-        // Check IP
-        IPAddress myIP = netMgr.getLocalIP();
-        if (myIP != IPAddress(0, 0, 0, 0)) {
-          Serial.println();
-          Serial.print("[System] WiFi Connected! IP: ");
-          Serial.println(myIP);
-          ipFound = true;
-          networkReady = true;
-          break;
-        }
-
-        Serial.print(".");
-        delay(500);
-      }
-
-      if (!ipFound) {
-        Serial.println(
-            "\n[System] WARNING: WiFi Connection Timeout or Retrieval Failed.");
-        Serial.println("[System] Check SSID/Password or ESP32 Link.");
-      }
-    } else {
-      Serial.println("[Network] ✗ WiFi driver initialization failed!");
+  while (millis() - waitStart < 15000) {
+    // 1. Maintain Audio Queue (Prevent Overflow/Crash)
+    while (recordQueue.available() > 0) {
+      recordQueue.readBuffer();
+      recordQueue.freeBuffer();
     }
+
+    // 2. Check IP
+    IPAddress myIP = netMgr.getLocalIP();
+    if (myIP != IPAddress(0, 0, 0, 0)) {
+      Serial.println();
+      Serial.print("[System] WiFi Connected! IP: ");
+      Serial.println(myIP);
+      ipFound = true;
+      break;
+    }
+
+    Serial.print(".");
+    delay(500);
   }
 
-  if (!networkReady) {
-    Serial.println("[Network] ERROR: No network available! Check Ethernet "
-                   "cable or WiFi settings.");
+  if (!ipFound) {
+    Serial.println(
+        "\n[System] WARNING: WiFi Connection Timeout or Retrieval Failed.");
+    Serial.println("[System] Check SSID/Password or ESP32 Link.");
   }
 
   delay(100);
 
+  // 7. Voter Client
+  Serial.println("[Voter] Initializing Protocol Client...");
+  // voter.begin(&netMgr);
+
+  // Serial.println("[System] Network Drivers DISABLED for Audio Test");
+
   // 4. GPS
 
   Serial.println("[GPS] Initializing GPS...");
-  gps.begin(&GPS_SERIAL, PPS_PIN);
+  gpsMgr.begin(&GPS_SERIAL, PPS_PIN);
 
   // 4.1 Config (Moved to top)
   // cfg.begin();
 
-  // Now we have config, resolve hostname if set
-  if (cfg.data.hostname[0] != '\0') {
-    Serial.print("[DNS] Hostname configured: ");
-    Serial.println(cfg.data.hostname);
-    Serial.println("[DNS] Resolving...");
-
-    IPAddress resolvedIP;
-    if (netMgr.getType() == DRIVER_WIFI_SPI) {
-      resolvedIP = spiDriver.resolveHostname(cfg.data.hostname);
-    } else if (netMgr.getType() == DRIVER_ETHERNET) {
-      resolvedIP = ethDriver.resolveHostname(cfg.data.hostname);
-    }
-
-    if (resolvedIP != IPAddress(0, 0, 0, 0)) {
-      cfg.setHostIP(resolvedIP);
-      Serial.print("[DNS] Using resolved IP: ");
-      Serial.println(resolvedIP);
-    } else {
-      Serial.println("[DNS] Resolution failed, using stored IP");
-    }
-  }
-
+  // Now we have config, set network target
   netMgr.setTarget(cfg.getHostIP(), cfg.data.hostPort);
 
   Serial.print("[System] Voter Target: ");
@@ -321,8 +264,8 @@ void setup() {
 
   // 5. Voter Client
   // Serial.println("[Voter] Initializing Protocol Client...");
-  voterClient.begin(&netMgr, &gps, cfg.getHostIP(), cfg.data.hostPort,
-                    cfg.data.clientPwd, cfg.data.hostPwd);
+  voter.begin(&netMgr, &gpsMgr, cfg.getHostIP(), cfg.data.hostPort,
+              cfg.data.clientPwd, cfg.data.hostPwd);
 
   // 6. DSP
   dsp.begin();
@@ -345,14 +288,6 @@ void setup() {
     Serial.print("ERROR: Decimator Init Failed! Code: ");
     Serial.println(status);
   }
-
-  // 7. Web Server
-  webServer.setConfig(&cfg);
-  webServer.setSystemObjects(&netMgr, &voterClient, &gps);
-  webServer.begin();
-  IPAddress webIP = Ethernet.localIP();
-  Serial.printf("[Web] Access at http://%u.%u.%u.%u\r\n", webIP[0], webIP[1],
-                webIP[2], webIP[3]);
 }
 
 // Helper for proper input echo
@@ -391,160 +326,6 @@ enum MenuState {
 };
 MenuState g_menuState = MENU_MAIN;
 
-// --- Settings Export/Import ---
-void exportSettings() {
-  Serial.println("\r\n# TeensyVoter Configuration Export");
-  Serial.printf("# Version: %u\r\n", CONFIG_VERSION);
-  Serial.println("# Copy this output to save your settings");
-  Serial.println("#");
-
-  // Network
-  Serial.printf("hostname=%s\r\n", cfg.data.hostname);
-  IPAddress hip(cfg.data.hostIP);
-  Serial.printf("hostIP=%u.%u.%u.%u\r\n", hip[0], hip[1], hip[2], hip[3]);
-  Serial.printf("hostPort=%u\r\n", cfg.data.hostPort);
-  Serial.printf("clientPwd=%s\r\n", cfg.data.clientPwd);
-  Serial.printf("hostPwd=%s\r\n", cfg.data.hostPwd);
-  Serial.printf("wifiSSID=%s\r\n", cfg.data.wifiSSID);
-  Serial.printf("wifiPass=%s\r\n", cfg.data.wifiPass);
-  IPAddress dns(cfg.data.dnsServerIP);
-  Serial.printf("dnsServerIP=%u.%u.%u.%u\r\n", dns[0], dns[1], dns[2], dns[3]);
-
-  // Radio
-  Serial.printf("useHwRSSI=%d\r\n", cfg.data.useHwRSSI ? 1 : 0);
-  Serial.printf("cosInvert=%d\r\n", cfg.data.cosInvert ? 1 : 0);
-  Serial.printf("cosMode=%d\r\n", cfg.data.cosMode);
-  Serial.printf("dspSquelchThresh=%d\r\n", cfg.data.dspSquelchThresh);
-  Serial.printf("rxGain=%d\r\n", cfg.data.rxGain);
-  Serial.printf("inputSource=%d\r\n", cfg.data.inputSource);
-  Serial.printf("rssiMin=%d\r\n", cfg.data.rssiMin);
-  Serial.printf("rssiMax=%d\r\n", cfg.data.rssiMax);
-  Serial.printf("dspCalib=%.1f\r\n", cfg.data.dspCalib);
-  Serial.printf("enablePLFilter=%d\r\n", cfg.data.enablePLFilter ? 1 : 0);
-  Serial.printf("enableDeemp=%d\r\n", cfg.data.enableDeemp ? 1 : 0);
-
-  Serial.println("#");
-  Serial.println("# End of export");
-}
-
-bool parseConfigLine(String line) {
-  line.trim();
-  if (line.length() == 0 || line.startsWith("#"))
-    return true; // Skip comments/empty
-
-  int eqPos = line.indexOf('=');
-  if (eqPos < 0)
-    return false; // Invalid format
-
-  String key = line.substring(0, eqPos);
-  String value = line.substring(eqPos + 1);
-  key.trim();
-  value.trim();
-
-  // Parse and apply settings
-  if (key == "hostname") {
-    cfg.setHostname(value.c_str());
-  } else if (key == "hostIP") {
-    IPAddress ip;
-    if (ip.fromString(value))
-      cfg.setHostIP(ip);
-    else
-      return false;
-  } else if (key == "hostPort") {
-    cfg.data.hostPort = value.toInt();
-  } else if (key == "clientPwd") {
-    strncpy(cfg.data.clientPwd, value.c_str(), sizeof(cfg.data.clientPwd) - 1);
-  } else if (key == "hostPwd") {
-    strncpy(cfg.data.hostPwd, value.c_str(), sizeof(cfg.data.hostPwd) - 1);
-  } else if (key == "wifiSSID") {
-    strncpy(cfg.data.wifiSSID, value.c_str(), sizeof(cfg.data.wifiSSID) - 1);
-  } else if (key == "wifiPass") {
-    strncpy(cfg.data.wifiPass, value.c_str(), sizeof(cfg.data.wifiPass) - 1);
-  } else if (key == "dnsServerIP") {
-    IPAddress dns;
-    if (dns.fromString(value))
-      cfg.data.dnsServerIP = (uint32_t)dns;
-    else
-      return false;
-  } else if (key == "useHwRSSI") {
-    cfg.data.useHwRSSI = (value.toInt() != 0);
-  } else if (key == "cosInvert") {
-    cfg.data.cosInvert = (value.toInt() != 0);
-  } else if (key == "cosMode") {
-    cfg.data.cosMode = value.toInt();
-  } else if (key == "dspSquelchThresh") {
-    cfg.data.dspSquelchThresh = value.toInt();
-  } else if (key == "rxGain") {
-    cfg.data.rxGain = value.toInt();
-  } else if (key == "inputSource") {
-    cfg.data.inputSource = value.toInt();
-  } else if (key == "rssiMin") {
-    cfg.data.rssiMin = value.toInt();
-  } else if (key == "rssiMax") {
-    cfg.data.rssiMax = value.toInt();
-  } else if (key == "dspCalib") {
-    cfg.data.dspCalib = value.toFloat();
-  } else if (key == "enablePLFilter") {
-    cfg.data.enablePLFilter = (value.toInt() != 0);
-  } else if (key == "enableDeemp") {
-    cfg.data.enableDeemp = (value.toInt() != 0);
-  } else {
-    return false; // Unknown key
-  }
-
-  return true;
-}
-
-void importSettings() {
-  Serial.println("\r\n--- Import Settings ---");
-  Serial.println("Paste settings below (empty line to finish):");
-  Serial.println();
-
-  int imported = 0;
-  int errors = 0;
-
-  while (true) {
-    // Wait for input with timeout
-    uint32_t startTime = millis();
-    String line = "";
-    while (millis() - startTime < 30000) { // 30 second timeout per line
-      if (Serial.available()) {
-        char c = Serial.read();
-        if (c == '\n' || c == '\r') {
-          if (line.length() == 0) {
-            // Empty line = done
-            goto import_done;
-          }
-          break; // Process this line
-        }
-        line += c;
-      }
-    }
-
-    if (line.length() == 0)
-      break; // Timeout or empty
-
-    // Parse line
-    if (parseConfigLine(line)) {
-      imported++;
-      Serial.printf("✓ %s\r\n", line.c_str());
-    } else {
-      errors++;
-      Serial.printf("✗ Invalid: %s\r\n", line.c_str());
-    }
-  }
-
-import_done:
-  Serial.println();
-  Serial.printf("Import complete: %d imported, %d errors\r\n", imported,
-                errors);
-
-  if (imported > 0) {
-    cfg.save();
-    Serial.println("Settings saved!");
-  }
-}
-
 void printMenu() {
   Serial.println("\r\n\r\n========================================");
   if (g_menuState == MENU_MAIN) {
@@ -564,19 +345,19 @@ void printMenu() {
     Serial.printf(" Device IP    : %u.%u.%u.%u\r\n", local[0], local[1],
                   local[2], local[3]);
     Serial.printf(" VOTER Server : %s\r\n",
-                  voterClient.isConnected() ? "CONNECTED" : "DISCONNECTED");
+                  voter.isConnected() ? "CONNECTED" : "DISCONNECTED");
     Serial.println(" -- GPS Status --");
-    Serial.printf(" Locked       : %s\r\n", gps.isLocked() ? "YES" : "NO");
-    Serial.printf(" Satellites   : %u\r\n", gps.getSatellites());
-    Serial.printf(" Time Set     : %s\r\n", gps.isTimeSet() ? "YES" : "NO");
-    if (gps.isTimeSet()) {
+    Serial.printf(" Locked       : %s\r\n", gpsMgr.isLocked() ? "YES" : "NO");
+    Serial.printf(" Satellites   : %u\r\n", gpsMgr.getSatellites());
+    Serial.printf(" Time Set     : %s\r\n", gpsMgr.isTimeSet() ? "YES" : "NO");
+    if (gpsMgr.isTimeSet()) {
       VTIME t;
-      gps.getNetworkTime(&t);
+      gpsMgr.getNetworkTime(&t);
       Serial.printf(" Voter Time   : %u.%09u\r\n", t.vtime_sec, t.vtime_nsec);
     }
-    Serial.printf(" PPS Jitter   : %u us\r\n", gps.getPpsJitter());
+    Serial.printf(" PPS Jitter   : %u us\r\n", gpsMgr.getPpsJitter());
     char lat[16], lon[16], elev[16];
-    gps.getGPSStrings(lat, lon, elev);
+    gpsMgr.getGPSStrings(lat, lon, elev);
     Serial.printf(" Location     : %s, %s (Elev: %s m)\r\n", lat, lon, elev);
     Serial.println("----------------------------------------");
     Serial.println(" [R] Refresh GPS Data");
@@ -584,76 +365,16 @@ void printMenu() {
   } else if (g_menuState == MENU_NETWORK) {
     Serial.println("           NETWORK MENU");
     Serial.println("========================================");
-
-    // Show active network type
-    if (netMgr.getType() == DRIVER_ETHERNET) {
-      Serial.println(" Network: Ethernet (NativeEthernet)");
-      IPAddress ip = netMgr.getLocalIP();
-      Serial.printf(" IP: %u.%u.%u.%u\r\n", ip[0], ip[1], ip[2], ip[3]);
-    } else if (netMgr.getType() == DRIVER_WIFI_SPI) {
-      Serial.println(" Network: WiFi (ESP32 SPI)");
-      IPAddress ip = netMgr.getLocalIP();
-      Serial.printf(" IP: %u.%u.%u.%u\r\n", ip[0], ip[1], ip[2], ip[3]);
-    }
-    Serial.println("----------------------------------------");
-
-    // Consolidate Host Address Display
     IPAddress hIP(cfg.data.hostIP);
-    if (cfg.data.hostname[0] != '\0') {
-      Serial.printf(" [3] Host Addr   : %s (Hostname)\r\n", cfg.data.hostname);
-    } else {
-      Serial.printf(" [3] Host Addr   : %u.%u.%u.%u (IP)\r\n", hIP[0], hIP[1],
-                    hIP[2], hIP[3]);
-    }
-
+    Serial.printf(" [3] Host IP     : %u.%u.%u.%u\r\n", hIP[0], hIP[1], hIP[2],
+                  hIP[3]);
     Serial.printf(" [4] Host Port   : %u\r\n", cfg.data.hostPort);
     Serial.printf(" [5] Client PWD  : %s\r\n", cfg.data.clientPwd);
     Serial.printf(" [6] Host PWD    : %s\r\n", cfg.data.hostPwd);
-
-    // Ethernet static IP options (only show when using Ethernet)
-    if (netMgr.getType() == DRIVER_ETHERNET) {
-      Serial.println("----------------------------------------");
-      Serial.printf(" [E] Use Static IP: %s\r\n",
-                    cfg.data.useStaticIP ? "YES" : "NO (DHCP)");
-      if (cfg.data.useStaticIP) {
-        IPAddress sip(cfg.data.staticIP);
-        IPAddress smask(cfg.data.subnetMask);
-        IPAddress gw(cfg.data.gateway);
-        IPAddress sdns(cfg.data.staticDNS);
-        Serial.printf(" [I] Static IP   : %u.%u.%u.%u\r\n", sip[0], sip[1],
-                      sip[2], sip[3]);
-        Serial.printf(" [N] Subnet Mask : %u.%u.%u.%u\r\n", smask[0], smask[1],
-                      smask[2], smask[3]);
-        Serial.printf(" [G] Gateway     : %u.%u.%u.%u\r\n", gw[0], gw[1], gw[2],
-                      gw[3]);
-        if (sdns != IPAddress(0, 0, 0, 0)) {
-          Serial.printf(" [D] DNS Server  : %u.%u.%u.%u\r\n", sdns[0], sdns[1],
-                        sdns[2], sdns[3]);
-        } else {
-          Serial.println(" [D] DNS Server  : (Use Gateway)");
-        }
-      }
-    }
-
-    // WiFi-specific options (only show when using WiFi)
-    if (netMgr.getType() == DRIVER_WIFI_SPI) {
-      Serial.println("----------------------------------------");
-      Serial.printf(" [W] WiFi SSID   : %s\r\n", cfg.data.wifiSSID);
-      Serial.println(" [P] Set WiFi Password");
-
-      IPAddress actualDNS = spiDriver.getDNSServer();
-      IPAddress cfgDNS(cfg.data.dnsServerIP);
-      if (cfg.data.dnsServerIP == 0) {
-        Serial.printf(
-            " [D] DNS Server  : (DHCP default - Retrieved: %u.%u.%u.%u)\r\n",
-            actualDNS[0], actualDNS[1], actualDNS[2], actualDNS[3]);
-      } else {
-        Serial.printf(" [D] DNS Server  : %u.%u.%u.%u (Static)\r\n", cfgDNS[0],
-                      cfgDNS[1], cfgDNS[2], cfgDNS[3]);
-      }
-      Serial.println(" [R] Resend WiFi Credentials to ESP32");
-    }
-
+    Serial.println("----------------------------------------");
+    Serial.printf(" [W] WiFi SSID   : %s\r\n", cfg.data.wifiSSID);
+    Serial.println(" [P] Set WiFi Password");
+    Serial.println(" [R] Resend WiFi Credentials to ESP32");
     Serial.println("----------------------------------------");
     Serial.println(" [S] Save & Reboot");
     Serial.println(" [x] Back to Main Menu");
@@ -695,11 +416,7 @@ void printMenu() {
     Serial.println("           DEBUG MENU");
     Serial.println("========================================");
     Serial.printf(" [T] Test Tone    : %s\r\n", g_testToneMode ? "ON" : "OFF");
-    Serial.printf(" [F] Force RSSI   : %d\r\n", g_forcedRSSI);
     Serial.println(" [D] Signal Monitor (Live Dashboard)");
-    Serial.println("----------------------------------------");
-    Serial.println(" [E] Export Settings");
-    Serial.println(" [I] Import Settings");
     Serial.println("----------------------------------------");
     Serial.println(" [x] Back to Main Menu");
   }
@@ -769,25 +486,12 @@ void handleSerialCLI() {
     } else if (g_menuState == MENU_NETWORK) {
       switch (c) {
       case '3': {
-        Serial.print("\r\nEnter Host Address (IP or Hostname): ");
-        String val = readStringEcho();
-        val.trim();
+        Serial.print("\r\nEnter Host IP: ");
+        String ipStr = readStringEcho();
         IPAddress ip;
-        if (ip.fromString(val)) {
-          // It's a valid IP
-          // Use direct cast instead of manual bit shifting to preserve byte
-          // order
-          cfg.data.hostIP = (uint32_t)ip;
-          // Clear hostname so IP takes precedence/shows in menu
-          cfg.setHostname("");
-          Serial.println("\r\n[Network] Set Host IP directly.");
-        } else {
-          // Treat as Hostname
-          if (val.length() < 64) {
-            cfg.setHostname(val.c_str());
-            Serial.println(
-                "\r\n[Network] Set Hostname. Will resolve on boot/save.");
-          }
+        if (ip.fromString(ipStr)) {
+          cfg.data.hostIP =
+              (ip[0] << 24) | (ip[1] << 16) | (ip[2] << 8) | ip[3];
         }
         printMenu();
         break;
@@ -833,95 +537,6 @@ void handleSerialCLI() {
         s.trim();
         if (s.length() < 64)
           strcpy(cfg.data.wifiPass, s.c_str());
-        printMenu();
-        break;
-      }
-
-      // Static IP configuration (Ethernet only)
-      case 'e':
-      case 'E': {
-        cfg.data.useStaticIP = !cfg.data.useStaticIP;
-        Serial.printf("\r\n[Network] Static IP %s\r\n",
-                      cfg.data.useStaticIP ? "ENABLED" : "DISABLED");
-        if (cfg.data.useStaticIP) {
-          Serial.println(
-              "[Network] NOTE: Reboot required for changes to take effect");
-        }
-        printMenu();
-        break;
-      }
-      case 'i':
-      case 'I': {
-        Serial.print("\r\nEnter Static IP: ");
-        String s = readStringEcho();
-        s.trim();
-        IPAddress ip;
-        if (ip.fromString(s)) {
-          cfg.data.staticIP = (uint32_t)ip;
-          Serial.println("\r\n[Network] Static IP updated");
-        } else {
-          Serial.println("\r\n[Network] Invalid IP address");
-        }
-        printMenu();
-        break;
-      }
-      case 'n':
-      case 'N': {
-        Serial.print("\r\nEnter Subnet Mask: ");
-        String s = readStringEcho();
-        s.trim();
-        IPAddress mask;
-        if (mask.fromString(s)) {
-          cfg.data.subnetMask = (uint32_t)mask;
-          Serial.println("\r\n[Network] Subnet mask updated");
-        } else {
-          Serial.println("\r\n[Network] Invalid subnet mask");
-        }
-        printMenu();
-        break;
-      }
-      case 'g':
-      case 'G': {
-        Serial.print("\r\nEnter Gateway IP: ");
-        String s = readStringEcho();
-        s.trim();
-        IPAddress gw;
-        if (gw.fromString(s)) {
-          cfg.data.gateway = (uint32_t)gw;
-          Serial.println("\r\n[Network] Gateway updated");
-        } else {
-          Serial.println("\r\n[Network] Invalid gateway address");
-        }
-        printMenu();
-        break;
-      }
-
-      case 'd':
-      case 'D': {
-        // DNS configuration - works for both WiFi and Ethernet static IP
-        if (netMgr.getType() == DRIVER_ETHERNET && cfg.data.useStaticIP) {
-          Serial.print("\r\nEnter DNS Server IP (or 0.0.0.0 to use gateway): ");
-          String s = readStringEcho();
-          s.trim();
-          if (s.length() > 0) {
-            IPAddress dns;
-            if (dns.fromString(s)) {
-              cfg.data.staticDNS = (uint32_t)dns;
-              Serial.println("\r\n[Network] Static DNS updated");
-            }
-          }
-        } else if (netMgr.getType() == DRIVER_WIFI_SPI) {
-          Serial.print(
-              "\r\nEnter DNS Server IP (or 0.0.0.0 for DHCP default): ");
-          String s = readStringEcho();
-          s.trim();
-          if (s.length() > 0) {
-            IPAddress dns;
-            if (dns.fromString(s)) {
-              cfg.data.dnsServerIP = (uint32_t)dns;
-            }
-          }
-        }
         printMenu();
         break;
       }
@@ -1043,29 +658,6 @@ void handleSerialCLI() {
         resetAudioState();
         printMenu();
         break;
-      case 'e':
-      case 'E':
-        exportSettings();
-        printMenu();
-        break;
-      case 'i':
-      case 'I':
-        importSettings();
-        printMenu();
-        break;
-      case 'f':
-      case 'F':
-        // TOGGLE: Disabled (-1) -> Min (0) -> Max (255) -> Disabled
-        if (g_forcedRSSI == -1)
-          g_forcedRSSI = 0; // Min Signal (Squelch Open, Weak)
-        else if (g_forcedRSSI == 0)
-          g_forcedRSSI = 255; // Saturated Signal
-        else
-          g_forcedRSSI = -1; // Disabled
-
-        Serial.printf("\r\n[DEBUG] Force RSSI set to: %d\r\n", g_forcedRSSI);
-        printMenu();
-        break;
       case 'd':
       case 'D': {
         Serial.println("\r\n--- Live Tuner (Press 'x' to Exit) ---");
@@ -1077,9 +669,9 @@ void handleSerialCLI() {
             recordQueue.readBuffer();
             recordQueue.freeBuffer();
           }
-          gps.update();
+          gpsMgr.update();
           netMgr.update();
-          voterClient.update();
+          voter.update();
           if (peak1.available()) {
             float v = peak1.read();
             bool isCosActive = false;
@@ -1113,21 +705,6 @@ void handleSerialCLI() {
                 Serial.print("      ");
               Serial.print(" | COS: ");
               Serial.print(isCosActive ? "ACT" : "___");
-              Serial.print(" | RSSI: ");
-              if (cfg.data.useHwRSSI) {
-                // Show raw analog and mapped
-                int raw = analogRead(RSSI_PIN);
-                int mapped =
-                    map(raw, cfg.data.rssiMin, cfg.data.rssiMax, 0, 255);
-                if (mapped < 0)
-                  mapped = 0;
-                if (mapped > 255)
-                  mapped = 255;
-                Serial.printf("%d (%d)", mapped, raw);
-              } else {
-                // DSP RSSI
-                Serial.printf("%d", dsp.getNoiseLevel());
-              }
 
               Serial.print(" [");
               // Bar graph 0-50 chars
@@ -1228,23 +805,21 @@ void loop() {
   static bool wasConnected = false;
   // Frame Counting State (Moved to top level scope)
   static uint32_t lastEpoch = 0;
-  static uint32_t baseNsec = 0;
   static uint32_t framesSent = 0;
 
-  if (voterClient.isConnected() && !wasConnected) {
+  if (voter.isConnected() && !wasConnected) {
     Serial.println();
     printMenu();
   }
-  wasConnected = voterClient.isConnected();
+  wasConnected = voter.isConnected();
 
   // 1. Core Updates
   handleSerialCLI();
   // Serial Passthrough Removed
 
-  gps.update();
+  gpsMgr.update();
   netMgr.update();
-  voterClient.update();
-  webServer.handleClient(); // Handle web requests
+  voter.update();
 
   // 2. Audio Processing Loop
   // Changed to 'if' to prevent starvation of GPS/Network if DSP is slow
@@ -1327,7 +902,7 @@ void loop() {
       // VOTER2 TIMING: Capture GPS timestamp NOW (at frame assembly)
       // This timestamp will be used for packet transmission
       VTIME frameTime;
-      gps.getNetworkTime(&frameTime);
+      gpsMgr.getNetworkTime(&frameTime);
 
       // 3. Inject Test Tone if enabled (Overwrites Accumulation Buffer)
       if (g_testToneMode) {
@@ -1426,49 +1001,30 @@ void loop() {
         // Use the proper client method which handles sequence, timestamp, and
         // sending
         VTIME frameTime = {0, 0};
-        if (gps.isTimeSet()) {
+        if (gpsMgr.isTimeSet()) {
           // STRICT FRAME COUNTING STRATEGY
           // Decouples timestamp from micros() jitter/phase drift.
 
-          // CONTINUOUS FRAME COUNTING STRATEGY (Approved Plan)
-          // Fixes "Timestamp Jumps" caused by buffer lag resyncing to wall
-          // clock.
+          uint32_t currentEpoch = gpsMgr.getEpoch();
 
-          uint32_t currentEpoch = gps.getEpoch();
-
-          // Reset Condition:
-          // 1. First run (lastEpoch == 0)
-          // 2. Large Gap (Transmission restarted after silence/squelch)
-          //    We detect restart by checking if we "stopped" sending recently?
-          //    Actually, we can just check if 'framesSent' is 0 (we must ensure
-          //    it is reset when we STOP sending)
-
-          if (framesSent == 0) {
-            // Capture EXACT start time (Seconds + Nanoseconds)
-            // This preserves the phase offset between GPS PPS and Audio Start
-            VTIME t;
-            gps.getNetworkTime(&t);
-            lastEpoch = t.vtime_sec;
-            baseNsec = t.vtime_nsec;
+          if (currentEpoch != lastEpoch) {
+            lastEpoch = currentEpoch;
+            framesSent = 0;
           }
 
-          // Compute Time: Base + Offset
-          // Use 64-bit math to prevent overflow of NSEC calculation
-          // Add the initial random phase offset (baseNsec) to the continuous
-          // frame count
-          uint64_t totalNsec =
-              (uint64_t)baseNsec +
-              ((uint64_t)framesSent * 20000000ULL); // 20ms per frame
+          // Basic Ideal Timestamp
+          frameTime.vtime_sec = currentEpoch;
+          frameTime.vtime_nsec = framesSent * 20000000; // 20ms in ns
 
-          uint32_t secOffset = (uint32_t)(totalNsec / 1000000000ULL);
-          uint32_t nsecRemainder = (uint32_t)(totalNsec % 1000000000ULL);
+          // Normalize NSEC
+          while (frameTime.vtime_nsec >= 1000000000) {
+            frameTime.vtime_nsec -= 1000000000;
+            frameTime.vtime_sec++;
+          }
 
-          frameTime.vtime_sec = lastEpoch + secOffset;
-          frameTime.vtime_nsec = nsecRemainder;
-
-          // Deduct Fixed Delay (180ms) for Voter Receiver Buffer
-          uint32_t delayNs = 180000000;
-
+          // Offset Logic (Maintained from previous step)
+          uint32_t delayNs = 180000000; // 180ms
+          // Subtract Delay safely
           if (frameTime.vtime_nsec >= delayNs) {
             frameTime.vtime_nsec -= delayNs;
           } else {
@@ -1477,46 +1033,12 @@ void loop() {
             frameTime.vtime_nsec =
                 (1000000000 + frameTime.vtime_nsec) - delayNs;
           }
-
-          // DRIFT GUARD: If we drift > 2 seconds from Real GPS Time, force a
-          // resync. This handles startup lags or long periods of silence where
-          // framesSent wasn't incrementing.
-          int32_t driftSec = (int32_t)(currentEpoch - frameTime.vtime_sec);
-          if (abs(driftSec) > 2) {
-            // Force Resync
-            lastEpoch = currentEpoch;
-            framesSent = 0;
-            // Re-calculate for this frame (recursive-ish, but simple linear
-            // calc is faster)
-            frameTime.vtime_sec = currentEpoch;
-            frameTime.vtime_nsec = 0;
-            // Apply delay
-            if (frameTime.vtime_nsec >= delayNs) {
-              frameTime.vtime_nsec -= delayNs;
-            } // Should not happen for 0
-            else {
-              frameTime.vtime_sec--;
-              frameTime.vtime_nsec = (1000000000 + 0) - delayNs;
-            }
-
-            // Debug print only if serial is open/fast enough?
-            // Serial.printf("[Time] Resync! Drift: %d s\r\n", driftSec);
-          }
         }
-
-        // FORCE RSSI Debug Override
-        if (g_forcedRSSI >= 0) {
-          finalRSSI = (uint8_t)g_forcedRSSI;
-        }
-
-        voterClient.processAudioFrame(ulawFrame, finalRSSI, frameTime);
-        if (gps.isTimeSet()) {
+        voter.processAudioFrame(ulawFrame, finalRSSI, frameTime);
+        if (gpsMgr.isTimeSet()) {
           framesSent++;
         }
         // Serial.println("[Test] Generated Audio Frame (Not Sent)");
-      } else {
-        // Not sending, reset continuous counter so next start uses fresh epoch
-        framesSent = 0;
       }
 
       // Move remaining

@@ -106,142 +106,6 @@ void EspSpiDriver::setCredentials(const char *ssid, const char *pass) {
   SPI.endTransaction();
 }
 
-IPAddress EspSpiDriver::resolveHostname(const char *hostname) {
-  if (!hostname || hostname[0] == '\0') {
-    return IPAddress(0, 0, 0, 0); // Invalid hostname
-  }
-
-  uint8_t hostnameLen = strlen(hostname);
-  if (hostnameLen > 63) {
-    Serial.println("[DNS] Hostname too long");
-    return IPAddress(0, 0, 0, 0);
-  }
-
-  Serial.printf("[DNS] Resolving: %s\n", hostname);
-
-  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(_cs, LOW);
-
-  // Send DNS lookup command
-  SPI.transfer(CMD_DNS_LOOKUP);
-  SPI.transfer(hostnameLen);
-  for (int i = 0; i < hostnameLen; i++) {
-    SPI.transfer(hostname[i]);
-  }
-
-  // Padding to flush FIFO
-  for (int k = 0; k < 4; k++) {
-    SPI.transfer(0x00);
-    delayMicroseconds(5);
-  }
-
-  delayMicroseconds(50);
-  digitalWrite(_cs, HIGH);
-  SPI.endTransaction();
-
-  // Wait for ESP32 to perform DNS lookup (can take 1-5 seconds)
-  Serial.println("[DNS] Waiting for response...");
-  uint32_t startTime = millis();
-  while (millis() - startTime < 10000) { // 10 second timeout
-    if (digitalRead(_ready) == HIGH) {
-      delayMicroseconds(500);
-
-      SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-      digitalWrite(_cs, LOW);
-
-      uint8_t status = SPI.transfer(0x00);
-      if (status & STATUS_HAS_DATA) {
-        uint8_t lenHi = SPI.transfer(0x00);
-        uint8_t lenLo = SPI.transfer(0x00);
-        uint16_t len = (lenHi << 8) | lenLo;
-
-        if (len == 4) { // IP address is 4 bytes
-          uint8_t ip[4];
-          for (int i = 0; i < 4; i++) {
-            ip[i] = SPI.transfer(0x00);
-          }
-
-          digitalWrite(_cs, HIGH);
-          SPI.endTransaction();
-
-          IPAddress result(ip[0], ip[1], ip[2], ip[3]);
-          if (result == IPAddress(0, 0, 0, 0)) {
-            Serial.println("[DNS] Resolution failed (0.0.0.0)");
-          } else {
-            Serial.printf("[DNS] Resolved to: %d.%d.%d.%d\n", ip[0], ip[1],
-                          ip[2], ip[3]);
-          }
-          return result;
-        }
-      }
-
-      digitalWrite(_cs, HIGH);
-      SPI.endTransaction();
-    }
-    delay(100); // Poll every 100ms
-  }
-
-  Serial.println("[DNS] Timeout");
-  return IPAddress(0, 0, 0, 0);
-}
-
-IPAddress EspSpiDriver::getDNSServer() {
-  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(_cs, LOW);
-
-  SPI.transfer(CMD_GET_DNS);
-
-  // Padding to flush FIFO
-  for (int k = 0; k < 4; k++) {
-    SPI.transfer(0x00);
-    delayMicroseconds(5);
-  }
-
-  delayMicroseconds(50);
-  digitalWrite(_cs, HIGH);
-  SPI.endTransaction();
-
-  // Wait for ESP32 response
-  uint32_t startTime = millis();
-  while (millis() - startTime < 2000) { // 2 second timeout
-    if (digitalRead(_ready) == HIGH) {
-      delayMicroseconds(500);
-
-      SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-      digitalWrite(_cs, LOW);
-
-      uint8_t status = SPI.transfer(0x00);
-      if (status & STATUS_HAS_DATA) {
-        uint8_t lenHi = SPI.transfer(0x00);
-        uint8_t lenLo = SPI.transfer(0x00);
-        uint16_t len = (lenHi << 8) | lenLo;
-
-        if (len == 4) { // IP address is 4 bytes
-          uint8_t ip[4];
-          for (int i = 0; i < 4; i++) {
-            ip[i] = SPI.transfer(0x00);
-          }
-
-          digitalWrite(_cs, HIGH);
-          SPI.endTransaction();
-
-          IPAddress result(ip[0], ip[1], ip[2], ip[3]);
-          Serial.printf("[DNS] Server: %d.%d.%d.%d\n", ip[0], ip[1], ip[2],
-                        ip[3]);
-          return result;
-        }
-      }
-
-      digitalWrite(_cs, HIGH);
-      SPI.endTransaction();
-    }
-    delay(50);
-  }
-
-  Serial.println("[DNS] Timeout getting DNS server");
-  return IPAddress(0, 0, 0, 0);
-}
-
 int EspSpiDriver::parsePacket() {
   // If ESP says "Ready", we read.
   if (digitalRead(_ready) == HIGH) {
@@ -346,8 +210,8 @@ IPAddress EspSpiDriver::getLocalIP() {
             IPAddress(_rxBuffer[0], _rxBuffer[1], _rxBuffer[2], _rxBuffer[3]);
         return _cachedIP;
       } else {
-        // Silently retry during WiFi connection
-        // Serial.printf("[SPI Debug] IP Rx Fail. Len=%d\r\n", len);
+        // Even if len is 0, print it if we thought we had data
+        Serial.printf("[SPI Debug] IP Rx Fail. Len=%d\r\n", len);
       }
     }
     delay(5);

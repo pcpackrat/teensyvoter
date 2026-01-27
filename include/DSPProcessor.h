@@ -6,7 +6,7 @@
 #include <arm_math.h>
 
 // Audio Settings
-#define AUDIO_BLOCK_SAMPLES 160 // Aligned with Voter Protocol (20ms Frame)
+#define DSP_BLOCK_SAMPLES 160 // Aligned with Voter Protocol (20ms Frame)
 #define SAMPLE_RATE 8000.0f
 #define FFT_SIZE 256 // Need at least block size
 
@@ -17,7 +17,7 @@ public:
   void begin();
 
   // Process a block of audio (in-place modification)
-  // input: 128 samples of int16
+  // input: 160 samples of int16 (DSP_BLOCK_SAMPLES)
   // enablePLFilter: High Pass > 300Hz
   // enableDeemp: Low Pass (6dB/oct)
   // Returns: Calculated RSSI (0-255) based on Noise Floor
@@ -37,18 +37,17 @@ private:
   // Coefficients (Converted to Float)
   float _rssiCoeffs[24]; // 23 taps + 1 for alignment if needed, but f32 doesn't
                          // need align
-  // State Buffers (Block Size + NumTaps - 1)
-  float _rssiState[128 + 24];
+  float _rssiState[DSP_BLOCK_SAMPLES + 24];
 
   // Integer Voice Filter
   VoiceFilter _intVoiceFilter;
 
   // Biquad HPF (300Hz)
   arm_biquad_casd_df1_inst_f32 _hpf;
-  float _hpfState[4];  // 4 state vars per stage (1 stage)
+  float _hpfState[4];  // State buffer for HPF Biquad
   float _hpfCoeffs[5]; // {b0, b1, b2, a1, a2}
 
-  float _scratchBuffer[256]; // Need a scratch buffer for split path
+  float _scratchBuffer[DSP_BLOCK_SAMPLES]; // Scratch buffer for processing
 
   // FFT State for Squelch
   arm_rfft_fast_instance_f32 _fft;
@@ -56,7 +55,7 @@ private:
   float _fftOutput[FFT_SIZE];
 
   // Internal Buffers
-  float _floatBuffer[AUDIO_BLOCK_SAMPLES];
+  float _floatBuffer[DSP_BLOCK_SAMPLES]; // Float conversion buffer
 
   // Last noise measurement (for squelch)
   uint8_t _lastNoiseLevel;
