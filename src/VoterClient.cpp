@@ -142,10 +142,10 @@ void VoterClient::update() {
           Serial.println("No Fix (Time Invalid)");
           break;
         case GPSManager::GPS_LOST_PPS:
-          Serial.println("PPS Lost (>1.1s)");
+          Serial.println("PPS Lost (>2.0s)");
           break;
         case GPSManager::GPS_LOST_SERIAL:
-          Serial.println("Serial Data Timeout (>2s)");
+          Serial.println("Serial Data Timeout (>5s)");
           break;
         case GPSManager::GPS_LOCKED:
           Serial.println("Transient Glitch (Recovered?)");
@@ -163,7 +163,8 @@ void VoterClient::update() {
     } else {
       // Lock is valid - Reset debounce timer
       if (_gpsLostTime != 0) {
-        Serial.println("[Voter] GPS Lock Recovered!");
+        Serial.printf("[Voter] GPS Lock Recovered! (Sats: %u)\r\n",
+                      _gps->getSatellites());
         _gpsLostTime = 0;
       }
     }
