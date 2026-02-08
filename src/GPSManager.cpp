@@ -147,6 +147,11 @@ GPSManager::GPSLockStatus GPSManager::getLockStatus() {
     return GPS_LOST_SERIAL;
   }
 
+  // REQUIRE STABLE LOCK: At least 4 satellites for connection
+  if (_gpsParser.satellites.value() < 4) {
+    return GPS_NO_FIX;
+  }
+
   return GPS_LOCKED;
 }
 
