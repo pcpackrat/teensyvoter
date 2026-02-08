@@ -42,11 +42,6 @@ private:
   // Integer Voice Filter
   VoiceFilter _intVoiceFilter;
 
-  // Biquad HPF (300Hz)
-  arm_biquad_casd_df1_inst_f32 _hpf;
-  float _hpfState[4];  // State buffer for HPF Biquad
-  float _hpfCoeffs[5]; // {b0, b1, b2, a1, a2}
-
   float _scratchBuffer[DSP_BLOCK_SAMPLES]; // Scratch buffer for processing
 
   // FFT State for Squelch

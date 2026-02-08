@@ -80,17 +80,12 @@ AudioConnection patchCord5(mixer1, 0, i2s_out, 1);
 // chain below
 
 AudioAnalyzePeak peak1;
-AudioAnalyzePeak peak1_raw;
 AudioConnection patchCordMeter(mixer1, 0, peak1, 0);
-AudioConnection patchCordMeterRaw(i2s_in, 0, peak1_raw, 0);
 
 // Anti-Aliasing Filter (LPF) before Downsampling
 AudioFilterBiquad lpf1;
 AudioConnection patchCord3(mixer1, 0, lpf1, 0);        // Mixer -> LPF
 AudioConnection patchCordLPF(lpf1, 0, recordQueue, 0); // LPF -> RecordQueue
-
-AudioSynthWaveformSine sine1;
-// AudioConnection patchCord6(sine1, 0, i2s_out, 1); // Tone Disabled
 
 AudioControlSGTL5000 sgtl5000_1;
 
@@ -107,8 +102,6 @@ WebServer webServer;
 ConfigManager cfg;
 
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
-
-// uint8_t g_simRSSI = 0; // Removed
 
 // -----------------------------------------------------------------------------
 // Helper: Reset Audio State
@@ -1087,11 +1080,7 @@ void handleSerialCLI() {
               isCosActive =
                   (digitalRead(COS_PIN) == (cfg.data.cosInvert ? HIGH : LOW));
             } else if (cfg.data.cosMode == COS_MODE_DSP) {
-              float v_raw = peak1_raw.available() ? peak1_raw.read() : 0.0f;
-              int dspVal = (int)(v_raw * 255.0f);
-              isCosActive = (dspVal > cfg.data.dspSquelchThresh);
-              if (cfg.data.cosInvert)
-                isCosActive = !isCosActive;
+              isCosActive = (dsp.getNoiseLevel() < cfg.data.dspSquelchThresh);
             } else {
               isCosActive = true;
             }
@@ -1239,7 +1228,6 @@ void loop() {
 
   // 1. Core Updates
   handleSerialCLI();
-  // Serial Passthrough Removed
 
   gps.update();
   netMgr.update();
@@ -1412,8 +1400,6 @@ void loop() {
           finalRSSI = 0;
         break;
       }
-
-      // g_noSignalMode logic removed
 
       // FORCE Test Tone to send
       if (g_testToneMode) {

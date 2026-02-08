@@ -58,6 +58,7 @@ private:
   void _generateChallenge();
   void _sendGPSPacket();
   uint32_t _lastGPSSend;
+  uint32_t _gpsLostTime;
 };
 
 #endif

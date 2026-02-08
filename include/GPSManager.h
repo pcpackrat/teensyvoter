@@ -16,7 +16,15 @@ public:
   void update();
 
   // Status
-  bool isLocked();  // True if GPS has fix and PPS is active
+  enum GPSLockStatus {
+    GPS_NO_FIX,      // No valid time/location
+    GPS_LOCKED,      // Time valid, PPS active, Serial active
+    GPS_LOST_PPS,    // Time valid, but PPS missing (>1.1s)
+    GPS_LOST_SERIAL, // Time valid, PPS active, but Serial missing (>2s)
+  };
+
+  bool isLocked(); // True if GPS_LOCKED
+  GPSLockStatus getLockStatus();
   bool isTimeSet(); // True if we have valid UTC time
 
   // Time Retrieval

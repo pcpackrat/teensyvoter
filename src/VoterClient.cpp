@@ -61,6 +61,7 @@ VoterClient::VoterClient() {
   _lastAttemptTime = 0;
   _serverDigest = 0;
   _myDigest = 0;
+  _gpsLostTime = 0;
   memset(_serverChallenge, 0, sizeof(_serverChallenge));
 }
 
@@ -91,10 +92,62 @@ void VoterClient::update() {
     if (millis() - _lastAttemptTime >
         2000) { // Retry every 2 seconds (was 500ms)
       _lastAttemptTime = millis();
-      _sendAuthPacket();
+      // Only attempt to connect if we have a GPS Lock
+      if (_gps && _gps->isLocked()) {
+        _sendAuthPacket();
+      } else {
+        // Optional: Print status periodically or just wait silently
+        static uint32_t lastPrint = 0;
+        if (millis() - lastPrint > 5000) {
+          lastPrint = millis();
+          Serial.println("[Voter] Waiting for GPS Lock before connecting...");
+        }
+      }
     }
   } else if (_state == VOTER_CONNECTED) {
-    // 3. Keepalive / GPS Packet (Periodic)
+    // 3. Check for GPS Lock Loss (with Debounce)
+    if (_gps && !_gps->isLocked()) {
+      if (_gpsLostTime == 0) {
+        _gpsLostTime = millis();
+        Serial.println("[Voter] GPS Lock Unstable... Debouncing...");
+      }
+
+      // Only disconnect if lock is lost for > 2000ms
+      if (millis() - _gpsLostTime > 2000) {
+        GPSManager::GPSLockStatus status = _gps->getLockStatus();
+        Serial.print("[Voter] GPS Lock Lost! Reason: ");
+        switch (status) {
+        case GPSManager::GPS_NO_FIX:
+          Serial.println("No Fix (Time Invalid)");
+          break;
+        case GPSManager::GPS_LOST_PPS:
+          Serial.println("PPS Lost (>1.1s)");
+          break;
+        case GPSManager::GPS_LOST_SERIAL:
+          Serial.println("Serial Data Timeout (>2s)");
+          break;
+        case GPSManager::GPS_LOCKED:
+          Serial.println("Transient Glitch (Recovered?)");
+          break;
+        default:
+          Serial.println("Unknown");
+          break;
+        }
+
+        _state = VOTER_DISCONNECTED;
+        _lastAttemptTime = millis(); // Force delay
+        _gpsLostTime = 0;            // Reset
+        return;
+      }
+    } else {
+      // Lock is valid - Reset debounce timer
+      if (_gpsLostTime != 0) {
+        Serial.println("[Voter] GPS Lock Recovered!");
+        _gpsLostTime = 0;
+      }
+    }
+
+    // 4. Keepalive / GPS Packet (Periodic)
     if (millis() - _lastGPSSend > 500) { // Every 500 ms
       _lastGPSSend = millis();
       _sendGPSPacket();
@@ -217,9 +270,12 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
   uint32_t incomingDigest = my_ntohl(header->digest);
   if (incomingDigest == _serverDigest) {
     if (_state != VOTER_CONNECTED) {
+      // CRITICAL FIX: Do not auto-connect if we don't have GPS lock!
+      if (_gps && !_gps->isLocked()) {
+        return;
+      }
+
       // Digest Matched -> We are Connected!
-      // Removed legacy check (type != PAYLOAD_AUTH) which was blocking
-      // connection
       Serial.println("[Voter] Authentication Successful! Connected to Host.");
       _state = VOTER_CONNECTED;
       _lastGPSSend = millis();

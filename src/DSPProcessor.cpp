@@ -18,9 +18,6 @@ void DSPProcessor::begin() {
 
   _intVoiceFilter.init();
 
-  // 3. Init Biquad HPF
-  arm_biquad_cascade_df1_init_f32(&_hpf, 1, _hpfCoeffs, _hpfState);
-
   // 4. Init Filter States
   _deempState = 0.0f;
   _prevIn = 0.0f;
@@ -43,28 +40,6 @@ void DSPProcessor::_calculateCoeffs() {
   for (int i = 0; i < 23; i++) {
     _rssiCoeffs[i] = (float)rssi_q15[i] / 32768.0f;
   }
-
-  // --- Voice Filter Coefficients REMOVED ---
-  // We now use the static table in VoiceFilter.cpp (Voter2 Port)
-
-  // Update Biquad? No, we are switching back to FIR.
-  // We can leave the Biquad junk in the header, it won't hurt.
-
-  // --- Biquad HPF 300Hz Coeffs (2nd Order Butterworth, Fs=8000) ---
-  // Calculated: b={0.846, -1.692, 0.846}, a={1.0, -1.669, 0.716}
-  // CMSIS Format: {b0, b1, b2, a1, a2} where a1/a2 are negated
-  // So a1_stored = -(-1.669) = 1.669. a2_stored = -(0.716) = -0.716.
-  // Wait, standard form: y[n] = b0*x + ... - a1*y[n-1] ...
-  // T.F. Denom: 1 - 1.669 z^-1 + 0.716 z^-2.
-  // So a1 = -1.669, a2 = 0.716.
-  // CMSIS expects NEGATED coefficients for the feedback path if the loop adds
-  // them. Standard CMSIS df1: y[n] = b0*x + ... + a1*y[n-1] + a2*y[n-2] So we
-  // store a1, a2 as positive 1.669, -0.716.
-  _hpfCoeffs[0] = 0.846f;  // b0
-  _hpfCoeffs[1] = -1.692f; // b1
-  _hpfCoeffs[2] = 0.846f;  // b2
-  _hpfCoeffs[3] = 1.669f;  // a1 (Feedback 1)
-  _hpfCoeffs[4] = -0.716f; // a2 (Feedback 2)
 }
 
 uint8_t DSPProcessor::process(int16_t *samples, bool enablePLFilter,
@@ -183,7 +158,6 @@ static uint8_t linear2ulaw(int16_t sample) {
   // ITU-T G.711 recommends bias 33 (0x21).
   // Let's try Bias 33.
 
-  uint16_t mask;
   int16_t sign = 0;
 
   if (sample < 0) {

@@ -414,13 +414,14 @@ void WebServer::handleAudio(EthernetClient &client) {
   client.println("\">");
   client.println("<p><small>SGTL5000 Line Input Level</small></p>");
 
-  // Digital Gain (DSP)
-  client.println("<label>Digital Gain (DSP Calibration):</label>");
+  // RSSI Calibration (DSP)
+  client.println("<label>RSSI Calibration Factor (DSP):</label>");
   client.print("<input type=\"number\" name=\"dspgain\" min=\"0\" max=\"50\" "
                "step=\"0.1\" value=\"");
   client.print(_config->data.dspCalib);
   client.println("\">");
-  client.println("<p><small>Default: 13.0</small></p>");
+  client.println(
+      "<p><small>Adjusts RSSI sensitivity (Default: 13.0)</small></p>");
 
   // Input Source
   client.println("<label>Input Source:</label>");

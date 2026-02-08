@@ -85,11 +85,24 @@ void GPSManager::update() {
   }
 }
 
-bool GPSManager::isLocked() {
-  // We consider it locked if we have valid time and PPS is active (seen
-  // recently)
+bool GPSManager::isLocked() { return getLockStatus() == GPS_LOCKED; }
+
+GPSManager::GPSLockStatus GPSManager::getLockStatus() {
+  if (!_validTime) {
+    return GPS_NO_FIX;
+  }
+
   bool ppsActive = (micros() - _lastPpsMicros) < 1100000;
-  return _validTime && ppsActive;
+  if (!ppsActive) {
+    return GPS_LOST_PPS;
+  }
+
+  bool serialActive = _gpsParser.time.age() < 2000;
+  if (!serialActive) {
+    return GPS_LOST_SERIAL;
+  }
+
+  return GPS_LOCKED;
 }
 
 bool GPSManager::isTimeSet() { return _validTime; }
