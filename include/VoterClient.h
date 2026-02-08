@@ -14,6 +14,13 @@ enum VoterState {
   VOTER_AUTH_ERROR = 3
 };
 
+enum VoterAuthError {
+  AUTH_ERR_NONE = 0,
+  AUTH_ERR_NO_RESPONSE = 1,
+  AUTH_ERR_HOST_MISMATCH = 2,
+  AUTH_ERR_CLIENT_REJECTED = 3
+};
+
 class VoterClient {
 public:
   VoterClient();
@@ -31,6 +38,7 @@ public:
   // Status
   bool isConnected() { return _state == VOTER_CONNECTED; }
   VoterState getState() { return _state; }
+  VoterAuthError getAuthError() { return _authError; }
 
 private:
   // Core Dependencies
@@ -45,6 +53,7 @@ private:
 
   // State
   VoterState _state;
+  VoterAuthError _authError;
   uint32_t _lastAttemptTime;
 
   // Protocol State

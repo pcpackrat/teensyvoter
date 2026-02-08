@@ -556,6 +556,31 @@ void printMenu() {
                   local[2], local[3]);
     Serial.printf(" VOTER Server : %s\r\n",
                   voterClient.isConnected() ? "CONNECTED" : "DISCONNECTED");
+
+    // Password Status
+    VoterAuthError authErr = voterClient.getAuthError();
+    const char *hostPwdStatus = "ACCEPTED";
+    const char *clientPwdStatus = "ACCEPTED";
+
+    if (!voterClient.isConnected()) {
+      if (authErr == AUTH_ERR_NO_RESPONSE) {
+        hostPwdStatus = "UNKNOWN";
+        clientPwdStatus = "UNKNOWN";
+      } else if (authErr == AUTH_ERR_HOST_MISMATCH) {
+        hostPwdStatus = "MISMATCH";
+        clientPwdStatus = "UNKNOWN";
+      } else if (authErr == AUTH_ERR_CLIENT_REJECTED) {
+        clientPwdStatus = "REJECTED";
+      } else {
+        hostPwdStatus = "PENDING";
+        clientPwdStatus = "PENDING";
+      }
+    }
+
+    Serial.printf(" Host PWD     : %s (%s)\r\n", cfg.data.hostPwd,
+                  hostPwdStatus);
+    Serial.printf(" Voter PWD    : %s (%s)\r\n", cfg.data.clientPwd,
+                  clientPwdStatus);
     Serial.println(" -- GPS Status --");
     Serial.printf(" Locked       : %s\r\n", gps.isLocked() ? "YES" : "NO");
     Serial.printf(" Satellites   : %u\r\n", gps.getSatellites());

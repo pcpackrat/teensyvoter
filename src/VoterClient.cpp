@@ -58,6 +58,7 @@ static const uint32_t crc_32_tab[] = {
 
 VoterClient::VoterClient() {
   _state = VOTER_DISCONNECTED;
+  _authError = AUTH_ERR_NONE;
   _lastAttemptTime = 0;
   _serverDigest = 0;
   _myDigest = 0;
@@ -103,13 +104,26 @@ void VoterClient::update() {
       }
     }
 
-    // Check for silent failure (Server ignoring us because of bad password)
-    // Warn once after 5 attempts (approx 10 seconds)
+    // Check for silent failure (Server ignoring us because of bad password or
+    // network) Warn once after 5 attempts (approx 10 seconds)
     if (_authAttempts >= 5 && !_hasWarnedAuth) {
       _hasWarnedAuth = true;
+
+      if (_state == VOTER_AUTHENTICATING) {
+        _authError = AUTH_ERR_CLIENT_REJECTED;
+        Serial.println("[Voter] WARNING: Client Password rejected by Host!");
+      } else if (_lastRxTime == 0) {
+        _authError = AUTH_ERR_NO_RESPONSE;
+        Serial.println(
+            "[Voter] WARNING: No response from Host. Check network!");
+      } else {
+        // Heard from host but never reached AUTHENTICATING state
+        _authError = AUTH_ERR_CLIENT_REJECTED;
+        Serial.println(
+            "[Voter] WARNING: Client Password rejected (Host silent).");
+      }
+
       _state = VOTER_AUTH_ERROR; // Stop retrying!
-      Serial.println(
-          "[Voter] WARNING: No response from Host. Check your passwords!");
     }
   } else if (_state == VOTER_CONNECTED) {
     // 3. Check for GPS Lock Loss (with Debounce)
@@ -278,6 +292,7 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
 
     // Always reply to a NEW challenge immediately
     _state = VOTER_DISCONNECTED;
+    _authError = AUTH_ERR_NONE;
     _authAttempts = 0; // Progress!
     _hasWarnedAuth = false;
     _sendAuthPacket();
@@ -308,6 +323,7 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
 
         Serial.println("[Voter] Authentication Successful! Connected to Host.");
         _state = VOTER_CONNECTED;
+        _authError = AUTH_ERR_NONE;
         _authAttempts = 0; // Success!
         _lastGPSSend = millis();
       }
@@ -319,6 +335,7 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
       if (!_hasWarnedAuth) {
         _hasWarnedAuth = true;
         _state = VOTER_AUTH_ERROR; // Stop retrying!
+        _authError = AUTH_ERR_HOST_MISMATCH;
         Serial.printf("[Voter] Auth Mismatch! Exp: 0x%08X Got: 0x%08X\r\n",
                       _serverDigest, incomingDigest);
         Serial.println(
@@ -333,8 +350,9 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
 
 void VoterClient::processAudioFrame(uint8_t *ulawData, uint8_t rssi,
                                     VTIME frameTime) {
-  if (_state != VOTER_CONNECTED)
+  if (_state != VOTER_CONNECTED) {
     return;
+  }
 
   // Construct Packet
   PROXY_AUDIO_PACKET pkt;

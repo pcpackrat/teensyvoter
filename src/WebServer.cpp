@@ -255,8 +255,50 @@ void WebServer::handleRoot(EthernetClient &client) {
   client.println(
       "      html += '<p><strong>Voter Status:</strong> <span class=\"status ' "
       "+ (data.voter.connected ? 'ok' : 'error') + '\">' + "
-      "(data.voter.connected ? 'CONNECTED' : 'DISCONNECTED') + '</span></p>';");
+      "(data.voter.connected ? 'CONNECTED' : 'DISCONNECTED') + '</span>';");
+  client.println(
+      "      if (!data.voter.connected && data.voter.authErrorMsg) {");
+  client.println("        html += ' <small style=\"color:#e74c3c\">(' + "
+                 "data.voter.authErrorMsg + ')</small>';");
+  client.println("      }");
+  client.println("      html += '</p>';");
+
+  client.println("      // Password acceptance status");
+  client.println("      let clientPwdStatus = '<span "
+                 "style=\"color:#27ae60\">ACCEPTED</span>';");
+  client.println("      let hostPwdStatus = '<span "
+                 "style=\"color:#27ae60\">ACCEPTED</span>';");
+  client.println("      ");
+  client.println("      if (!data.voter.connected) {");
+  client.println("          if (data.voter.authError == 1) { // NO_RESPONSE");
+  client.println("              clientPwdStatus = '<span "
+                 "style=\"color:#95a5a6\">UNKNOWN</span>';");
+  client.println("              hostPwdStatus = '<span "
+                 "style=\"color:#95a5a6\">UNKNOWN</span>';");
+  client.println(
+      "          } else if (data.voter.authError == 2) { // HOST_MISMATCH");
+  client.println("              hostPwdStatus = '<span "
+                 "style=\"color:#e74c3c\">MISMATCH</span>';");
+  client.println("              clientPwdStatus = '<span "
+                 "style=\"color:#95a5a6\">UNKNOWN</span>';");
+  client.println(
+      "          } else if (data.voter.authError == 3) { // CLIENT_REJECTED");
+  client.println("              clientPwdStatus = '<span "
+                 "style=\"color:#e74c3c\">REJECTED</span>';");
+  client.println("          } else {");
+  client.println("              clientPwdStatus = '<span "
+                 "style=\"color:#95a5a6\">PENDING</span>';");
+  client.println("              hostPwdStatus = '<span "
+                 "style=\"color:#95a5a6\">PENDING</span>';");
+  client.println("          }");
+  client.println("      }");
+  client.println("");
+  client.println("      html += '<p><strong>Host Password:</strong> ' + "
+                 "hostPwdStatus + '</p>';");
+  client.println("      html += '<p><strong>Voter Password:</strong> ' + "
+                 "clientPwdStatus + '</p>';");
   client.println("      html += '<hr>';");
+
   client.println(
       "      html += '<p><strong>RSSI:</strong> ' + data.audio.rssi + '</p>';");
   client.println("      html += '<p><strong>Audio Peak:</strong> ' + "
@@ -544,6 +586,14 @@ void WebServer::handleApiStatus(EthernetClient &client) {
   }
   uint16_t hostPort = _config ? _config->data.hostPort : 0;
   bool voterConnected = _voter ? _voter->isConnected() : false;
+  VoterAuthError authErr = _voter ? _voter->getAuthError() : AUTH_ERR_NONE;
+  const char *authErrStr = "";
+  if (authErr == AUTH_ERR_NO_RESPONSE)
+    authErrStr = "No Response from Host";
+  else if (authErr == AUTH_ERR_HOST_MISMATCH)
+    authErrStr = "Host Password Mismatch";
+  else if (authErr == AUTH_ERR_CLIENT_REJECTED)
+    authErrStr = "Voter Password Rejected";
 
   // Get GPS info
   bool gpsLocked = _gps ? _gps->isLocked() : false;
@@ -592,7 +642,14 @@ void WebServer::handleApiStatus(EthernetClient &client) {
   client.print(hostPort);
   client.println(",");
   client.print("    \"connected\": ");
-  client.println(voterConnected ? "true" : "false");
+  client.print(voterConnected ? "true" : "false");
+  client.println(",");
+  client.print("    \"authError\": ");
+  client.print((int)authErr);
+  client.println(",");
+  client.print("    \"authErrorMsg\": \"");
+  client.print(authErrStr);
+  client.println("\"");
   client.println("  },");
   client.println("  \"audio\": {");
   client.print("    \"rssi\": ");
