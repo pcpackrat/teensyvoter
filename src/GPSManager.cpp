@@ -10,6 +10,7 @@ GPSManager::GPSManager() {
   _currentEpoch = 0;
   _validTime = false;
   _ppsPeriod = 1000000;
+  _lastLockStatus = GPS_NO_FIX;
   _instance = this;
 }
 
@@ -82,6 +83,49 @@ void GPSManager::update() {
         Teensy3Clock.set(gpsTime);
       }
     }
+  }
+
+  // 3. Track Status Transitions with detailed logging
+  GPSLockStatus currentStatus = getLockStatus();
+  if (currentStatus != _lastLockStatus) {
+    const char *oldStr = "UNKNOWN";
+    const char *newStr = "UNKNOWN";
+
+    auto statusToStr = [](GPSLockStatus s) {
+      switch (s) {
+      case GPS_NO_FIX:
+        return "NO_FIX";
+      case GPS_LOCKED:
+        return "LOCKED";
+      case GPS_LOST_PPS:
+        return "LOST_PPS";
+      case GPS_LOST_SERIAL:
+        return "LOST_SERIAL";
+      default:
+        return "UNKNOWN";
+      }
+    };
+
+    oldStr = statusToStr(_lastLockStatus);
+    newStr = statusToStr(currentStatus);
+
+    Serial.printf("[GPS] Status Change: %s -> %s\r\n", oldStr, newStr);
+
+    // Provide specific context for why it dropped out
+    if (currentStatus == GPS_LOST_PPS) {
+      uint32_t age = micros() - _lastPpsMicros;
+      Serial.printf(
+          "[GPS] Context: PPS Timeout. Age: %u us (Limit: 1100000)\r\n", age);
+    } else if (currentStatus == GPS_LOST_SERIAL) {
+      uint32_t age = _gpsParser.time.age();
+      Serial.printf(
+          "[GPS] Context: Serial Timeout. Age: %u ms (Limit: 2000)\r\n", age);
+    } else if (currentStatus == GPS_LOCKED) {
+      Serial.printf("[GPS] Context: Fix Restored. Sats: %u\r\n",
+                    getSatellites());
+    }
+
+    _lastLockStatus = currentStatus;
   }
 }
 
