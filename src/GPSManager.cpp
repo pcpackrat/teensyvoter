@@ -121,9 +121,14 @@ void GPSManager::update() {
       Serial.printf(
           "[GPS] Context: Serial Timeout. Age: %u ms (Limit: 5000)\r\n", age);
     } else if (currentStatus == GPS_LOCKED) {
-      Serial.printf(
-          "[GPS] Context: Fix Restored. Sats: %u, PPS Period: %u us\r\n",
-          getSatellites(), _ppsPeriod);
+      if (_ppsPeriod < 5000000) {
+        Serial.printf(
+            "[GPS] Context: Fix Restored. Sats: %u, PPS Period: %u us\r\n",
+            getSatellites(), _ppsPeriod);
+      } else {
+        Serial.printf("[GPS] Context: Fix Restored. Sats: %u\r\n",
+                      getSatellites());
+      }
     }
 
     _lastLockStatus = currentStatus;

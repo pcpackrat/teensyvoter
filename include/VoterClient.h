@@ -73,6 +73,7 @@ private:
   uint32_t _authAttempts;
   uint32_t _lastRxTime;
   bool _hasWarnedAuth;
+  bool _hasWarnedGps;
 };
 
 #endif

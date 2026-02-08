@@ -60,12 +60,15 @@ VoterClient::VoterClient() {
   _state = VOTER_DISCONNECTED;
   _authError = AUTH_ERR_NONE;
   _lastAttemptTime = 0;
-  _serverDigest = 0;
-  _myDigest = 0;
+  _lastGPSSend = 0;
   _gpsLostTime = 0;
   _authAttempts = 0;
   _lastRxTime = 0;
   _hasWarnedAuth = false;
+  _hasWarnedGps = false;
+  _serverDigest = 0;
+  _myDigest = 0;
+  memset(_myChallenge, 0, sizeof(_myChallenge));
   memset(_serverChallenge, 0, sizeof(_serverChallenge));
 }
 
@@ -130,6 +133,11 @@ void VoterClient::update() {
     if (_gps && !_gps->isLocked()) {
       if (_gpsLostTime == 0) {
         _gpsLostTime = millis();
+      }
+
+      // Print "Unstable" warning only after 500ms of loss
+      if (!_hasWarnedGps && (millis() - _gpsLostTime > 500)) {
+        _hasWarnedGps = true;
         Serial.println("[Voter] GPS Lock Unstable... Debouncing...");
       }
 
@@ -163,9 +171,12 @@ void VoterClient::update() {
     } else {
       // Lock is valid - Reset debounce timer
       if (_gpsLostTime != 0) {
-        Serial.printf("[Voter] GPS Lock Recovered! (Sats: %u)\r\n",
-                      _gps->getSatellites());
+        if (_hasWarnedGps) {
+          Serial.printf("[Voter] GPS Lock Recovered! (Sats: %u)\r\n",
+                        _gps->getSatellites());
+        }
         _gpsLostTime = 0;
+        _hasWarnedGps = false;
       }
     }
 
