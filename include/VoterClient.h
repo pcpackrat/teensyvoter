@@ -10,7 +10,8 @@
 enum VoterState {
   VOTER_DISCONNECTED = 0,
   VOTER_AUTHENTICATING = 1,
-  VOTER_CONNECTED = 2
+  VOTER_CONNECTED = 2,
+  VOTER_AUTH_ERROR = 3
 };
 
 class VoterClient {
@@ -29,6 +30,7 @@ public:
 
   // Status
   bool isConnected() { return _state == VOTER_CONNECTED; }
+  VoterState getState() { return _state; }
 
 private:
   // Core Dependencies
@@ -59,6 +61,9 @@ private:
   void _sendGPSPacket();
   uint32_t _lastGPSSend;
   uint32_t _gpsLostTime;
+  uint32_t _authAttempts;
+  uint32_t _lastRxTime;
+  bool _hasWarnedAuth;
 };
 
 #endif

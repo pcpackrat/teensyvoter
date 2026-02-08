@@ -129,8 +129,6 @@ void setup() {
   Serial.println(cfg.getHostIP());
   Serial.print("Port: ");
   Serial.println(cfg.data.hostPort);
-  Serial.print("Auth: ");
-  Serial.println(cfg.data.clientPwd);
   Serial.print("WiFi SSID: ");
   Serial.println(cfg.data.wifiSSID);
   Serial.println("---------------------");
@@ -344,8 +342,8 @@ void setup() {
   webServer.setSystemObjects(&netMgr, &voterClient, &gps);
   webServer.begin();
   IPAddress webIP = Ethernet.localIP();
-  Serial.printf("[Web] Access at http://%u.%u.%u.%u\r\n", webIP[0], webIP[1],
-                webIP[2], webIP[3]);
+  // Serial.printf("[Web] Access at http://%u.%u.%u.%u\r\n", webIP[0], webIP[1],
+  //               webIP[2], webIP[3]);
 }
 
 // Helper for proper input echo
@@ -1213,18 +1211,22 @@ void handleSerialCLI() {
 }
 
 void loop() {
-  // Auto-Show Menu on Connect
-  static bool wasConnected = false;
-  // Frame Counting State (Moved to top level scope)
+  // Auto-Show Menu on Connect or Error (Final State)
+  static VoterState lastReportedState = VOTER_DISCONNECTED;
+  VoterState currentState = voterClient.getState();
+
+  // Frame Counting State (Crucial for Audio Timestamps)
   static uint32_t lastEpoch = 0;
   static uint32_t baseNsec = 0;
   static uint32_t framesSent = 0;
 
-  if (voterClient.isConnected() && !wasConnected) {
-    Serial.println();
-    printMenu();
+  if (currentState != lastReportedState) {
+    if (currentState == VOTER_CONNECTED || currentState == VOTER_AUTH_ERROR) {
+      Serial.println();
+      printMenu();
+    }
+    lastReportedState = currentState;
   }
-  wasConnected = voterClient.isConnected();
 
   // 1. Core Updates
   handleSerialCLI();

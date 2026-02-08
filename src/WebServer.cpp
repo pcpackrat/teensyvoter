@@ -78,7 +78,7 @@ WebServer::WebServer()
 
 void WebServer::begin() {
   _server.begin();
-  Serial.println("[Web] Server started on port 80");
+  // Serial.println("[Web] Server started on port 80");
 }
 
 void WebServer::setConfig(ConfigManager *cfg) { _config = cfg; }
@@ -93,10 +93,10 @@ void WebServer::setSystemObjects(NetworkManager *netMgr, VoterClient *voter,
 void WebServer::handleClient() {
   EthernetClient client = _server.available();
   if (client) {
-    Serial.println("[Web] New client connected");
+    // Serial.println("[Web] New client connected");
     handleRequest(client);
     client.stop();
-    Serial.println("[Web] Client disconnected");
+    // Serial.println("[Web] Client disconnected");
   }
 }
 
@@ -125,7 +125,7 @@ void WebServer::handleRequest(EthernetClient &client) {
   String method, path;
   parseRequest(requestLine, method, path);
 
-  Serial.printf("[Web] %s %s\n", method.c_str(), path.c_str());
+  // Serial.printf("[Web] %s %s\n", method.c_str(), path.c_str());
 
   // Read POST body if present
   String body = "";
@@ -700,7 +700,7 @@ void WebServer::sendJsonResponse(EthernetClient &client, bool success,
 // POST Handlers
 
 void WebServer::handleNetworkPost(EthernetClient &client, const String &body) {
-  Serial.println("[Web] Processing network config POST");
+  // Serial.println("[Web] Processing network config POST");
 
   // Parse form data
   String mode = getFormValue(body, "mode");
@@ -738,7 +738,7 @@ void WebServer::handleNetworkPost(EthernetClient &client, const String &body) {
   // Save to EEPROM
   _config->save();
 
-  Serial.println("[Web] Network config saved, rebooting...");
+  // Serial.println("[Web] Network config saved, rebooting...");
 
   // Send response
   sendJsonResponse(client, true, "Configuration saved. Rebooting...");
@@ -750,7 +750,7 @@ void WebServer::handleNetworkPost(EthernetClient &client, const String &body) {
 }
 
 void WebServer::handleVoterPost(EthernetClient &client, const String &body) {
-  Serial.println("[Web] Processing voter config POST");
+  // Serial.println("[Web] Processing voter config POST");
 
   // Parse form data
   String host = getFormValue(body, "host");
@@ -774,7 +774,7 @@ void WebServer::handleVoterPost(EthernetClient &client, const String &body) {
   // Save to EEPROM
   _config->save();
 
-  Serial.println("[Web] Voter config saved, rebooting...");
+  // Serial.println("[Web] Voter config saved, rebooting...");
 
   // Send response
   sendJsonResponse(client, true, "Configuration saved. Rebooting...");
@@ -786,7 +786,7 @@ void WebServer::handleVoterPost(EthernetClient &client, const String &body) {
 }
 
 void WebServer::handleAudioPost(EthernetClient &client, const String &body) {
-  Serial.println("[Web] Processing audio config POST");
+  // Serial.println("[Web] Processing audio config POST");
 
   // Parse form data
   String rxGainStr = getFormValue(body, "rxgain");
@@ -820,7 +820,7 @@ void WebServer::handleAudioPost(EthernetClient &client, const String &body) {
   // Save to EEPROM
   _config->save();
 
-  Serial.println("[Web] Audio config saved");
+  // Serial.println("[Web] Audio config saved");
 
   // Send redirect back to audio page
   sendRedirect(client, "/audio");

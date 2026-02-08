@@ -62,6 +62,9 @@ VoterClient::VoterClient() {
   _serverDigest = 0;
   _myDigest = 0;
   _gpsLostTime = 0;
+  _authAttempts = 0;
+  _lastRxTime = 0;
+  _hasWarnedAuth = false;
   memset(_serverChallenge, 0, sizeof(_serverChallenge));
 }
 
@@ -88,7 +91,7 @@ void VoterClient::update() {
   }
 
   // 2. Authentication Loop
-  if (_state == VOTER_DISCONNECTED) {
+  if (_state == VOTER_DISCONNECTED || _state == VOTER_AUTHENTICATING) {
     if (millis() - _lastAttemptTime >
         2000) { // Retry every 2 seconds (was 500ms)
       _lastAttemptTime = millis();
@@ -96,13 +99,17 @@ void VoterClient::update() {
       if (_gps && _gps->isLocked()) {
         _sendAuthPacket();
       } else {
-        // Optional: Print status periodically or just wait silently
-        static uint32_t lastPrint = 0;
-        if (millis() - lastPrint > 5000) {
-          lastPrint = millis();
-          Serial.println("[Voter] Waiting for GPS Lock before connecting...");
-        }
+        Serial.println("[Voter] Waiting for GPS Lock before connecting...");
       }
+    }
+
+    // Check for silent failure (Server ignoring us because of bad password)
+    // Warn once after 5 attempts (approx 10 seconds)
+    if (_authAttempts >= 5 && !_hasWarnedAuth) {
+      _hasWarnedAuth = true;
+      _state = VOTER_AUTH_ERROR; // Stop retrying!
+      Serial.println(
+          "[Voter] WARNING: No response from Host. Check your passwords!");
     }
   } else if (_state == VOTER_CONNECTED) {
     // 3. Check for GPS Lock Loss (with Debounce)
@@ -171,7 +178,9 @@ uint32_t VoterClient::_crc32(const uint8_t *buf1, const uint8_t *buf2) {
 }
 
 void VoterClient::_generateChallenge() {
-  snprintf(_myChallenge, 10, "%lu", random(10000000, 99999999));
+  memset(_myChallenge, 0, sizeof(_myChallenge));
+  snprintf(_myChallenge, VOTER_CHALLENGE_LEN, "%lu",
+           random(10000000, 99999999));
 }
 
 void VoterClient::_sendAuthPacket() {
@@ -194,6 +203,7 @@ void VoterClient::_sendAuthPacket() {
   header.payload_type = my_htons(PAYLOAD_AUTH);
 
   Serial.println("[Voter] Sending Auth Request...");
+  _authAttempts++;
   _net->sendPacket((uint8_t *)&header, sizeof(header));
 }
 
@@ -239,29 +249,37 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
   memset(rcvChallenge, 0, sizeof(rcvChallenge));
   memcpy(rcvChallenge, header->challenge, VOTER_CHALLENGE_LEN);
 
+  // Ignore packets that we sent (loopback/broadcast)
+  if (strncmp(rcvChallenge, _myChallenge, VOTER_CHALLENGE_LEN) == 0) {
+    return;
+  }
+
+  // Valid packet received - Update tracking
+  _lastRxTime = millis();
+  // _authAttempts = 0; // REMOVED: Only reset on progress/new session to allow
+  // failure timeout _hasWarnedAuth reset moved to happy path in digest check
+
   // Debug info
-  // Serial.printf("[Voter] RX Challenge: %s Type: 0x%04X\n", rcvChallenge,
-  // my_ntohs(header->payload_type));
 
   bool newChallenge =
       (strncmp(rcvChallenge, _serverChallenge, VOTER_CHALLENGE_LEN) != 0);
   uint16_t type = my_ntohs(header->payload_type);
 
   if (newChallenge) {
-    Serial.printf("[Voter] New Server Challenge: %s\r\n", rcvChallenge);
+    Serial.printf("[Voter] New Server Challenge: %s (My Chl: %s)\r\n",
+                  rcvChallenge, _myChallenge);
     memcpy(_serverChallenge, rcvChallenge, VOTER_CHALLENGE_LEN);
 
     // Recalculate Digests
     _myDigest = _crc32((uint8_t *)_serverChallenge, (uint8_t *)_clientPwd);
     _serverDigest = _crc32((uint8_t *)_myChallenge, (uint8_t *)_hostPwd);
 
-    Serial.printf("[Voter] My Pwd: '%s' -> My Digest: 0x%08X\r\n", _clientPwd,
-                  _myDigest);
-    Serial.printf("[Voter] Hst Pwd: '%s' -> Svr Digest: 0x%08X\r\n", _hostPwd,
-                  _serverDigest);
+    Serial.println("[Voter] Updated authentication digests");
 
     // Always reply to a NEW challenge immediately
     _state = VOTER_DISCONNECTED;
+    _authAttempts = 0; // Progress!
+    _hasWarnedAuth = false;
     _sendAuthPacket();
     return;
   }
@@ -269,24 +287,46 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
   // Verify Server Digest
   uint32_t incomingDigest = my_ntohl(header->digest);
   if (incomingDigest == _serverDigest) {
-    if (_state != VOTER_CONNECTED) {
-      // CRITICAL FIX: Do not auto-connect if we don't have GPS lock!
-      if (_gps && !_gps->isLocked()) {
-        return;
+    _hasWarnedAuth = false; // Reset warning state on happy path
+    // If we get an AUTH packet, we've verified the HOST, but not our own
+    // acceptance
+    if (type == PAYLOAD_AUTH) {
+      if (_state == VOTER_DISCONNECTED) {
+        Serial.printf(
+            "[Voter] Host Password Accepted (Exp: 0x%08X Got: 0x%08X)\r\n",
+            _serverDigest, incomingDigest);
+        Serial.println("[Voter] Handshaking... Waiting for Host acceptance.");
+        _state = VOTER_AUTHENTICATING;
       }
+    } else {
+      // Any other packet type confirms the server accepted our digest!
+      if (_state != VOTER_CONNECTED) {
+        // CRITICAL FIX: Do not auto-connect if we don't have GPS lock!
+        if (_gps && !_gps->isLocked()) {
+          return;
+        }
 
-      // Digest Matched -> We are Connected!
-      Serial.println("[Voter] Authentication Successful! Connected to Host.");
-      _state = VOTER_CONNECTED;
-      _lastGPSSend = millis();
+        Serial.println("[Voter] Authentication Successful! Connected to Host.");
+        _state = VOTER_CONNECTED;
+        _authAttempts = 0; // Success!
+        _lastGPSSend = millis();
+      }
     }
   } else {
     // If Digest Mismatch AND it was an AUTH packet, it might be a challenge we
     // missed or a retry
     if (type == PAYLOAD_AUTH) {
-      Serial.printf("[Voter] Auth Retry/Mismatch! Exp: 0x%08X Got: 0x%08X\r\n",
-                    _serverDigest, incomingDigest);
-      _sendAuthPacket();
+      if (!_hasWarnedAuth) {
+        _hasWarnedAuth = true;
+        _state = VOTER_AUTH_ERROR; // Stop retrying!
+        Serial.printf("[Voter] Auth Mismatch! Exp: 0x%08X Got: 0x%08X\r\n",
+                      _serverDigest, incomingDigest);
+        Serial.println(
+            "[Voter] Authentication Failed: Password Mismatch. Please "
+            "check your Voter and Host passwords.");
+      }
+      // DO NOT resend here! Let the 2-second retry loop in update() handle it.
+      // This prevents a rapid-fire feedback loop between client and server.
     }
   }
 }
