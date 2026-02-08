@@ -180,9 +180,11 @@ void setup() {
   lpf1.setLowpass(1, 3600,
                   0.707); // Total 2 stages for steeper rolloff (24dB/oct)
 
-  // 2. Hardware Serial
-  // WIFI_SERIAL.begin(115200); // Removed
   GPS_SERIAL.begin(9600);
+
+  // 2.1 Start GPS Acquisition immediately (don't wait for Network)
+  Serial.println("[GPS] Initializing GPS...");
+  gps.begin(&GPS_SERIAL, PPS_PIN);
 
   Serial.println("[System] Boot Complete: Audio + Network + GPS");
 
@@ -271,11 +273,6 @@ void setup() {
   }
 
   delay(100);
-
-  // 4. GPS
-
-  Serial.println("[GPS] Initializing GPS...");
-  gps.begin(&GPS_SERIAL, PPS_PIN);
 
   // 4.1 Config (Moved to top)
   // cfg.begin();
