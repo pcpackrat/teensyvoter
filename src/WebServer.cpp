@@ -62,7 +62,7 @@ h2{color:#ecf0f1;border-bottom:2px solid #3498db;padding-bottom:10px}
 
 const char HTML_NAV[] PROGMEM = R"rawliteral(
 <div class="nav">
-<a href="/">Dashboard</a>
+<a href="/">Status</a>
 <a href="/network">Network</a>
 <a href="/voter">Voter</a>
 <a href="/audio">Audio</a>
@@ -613,14 +613,18 @@ void WebServer::handleApiStatus(EthernetClient &client) {
 
   // Get audio/RSSI info (access global objects from main.cpp)
   extern AudioAnalyzePeak peak1;
+  extern volatile uint8_t g_currentRSSI;
+  extern volatile bool g_cosActive;
 
-  int rssiRaw = analogRead(A14);                 // RSSI_PIN from main.cpp
-  int rssiValue = map(rssiRaw, 0, 1023, 0, 255); // Map to 0-255 range
+  // int rssiRaw = analogRead(A14);                 // RSSI_PIN from main.cpp
+  // int rssiValue = map(rssiRaw, 0, 1023, 0, 255); // Map to 0-255 range
+  int rssiValue = g_currentRSSI;
+
   float audioPeak = 0.0;
   if (peak1.available()) {
     audioPeak = peak1.read();
   }
-  bool cosActive = false; // TODO: Add COS status if needed
+  bool cosActive = g_cosActive;
 
   // Build JSON response
   client.println("{");

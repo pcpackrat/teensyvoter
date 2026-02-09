@@ -351,6 +351,16 @@ IPAddress EspSpiDriver::getLocalIP() {
   return IPAddress(0, 0, 0, 0);
 }
 
+IPAddress EspSpiDriver::getSubnetMask() {
+  return IPAddress(0, 0, 0, 0); // Not supported over SPI yet
+}
+
+IPAddress EspSpiDriver::getGateway() {
+  return IPAddress(0, 0, 0, 0); // Not supported over SPI yet
+}
+
+IPAddress EspSpiDriver::getDNS() { return getDNSServer(); }
+
 void EspSpiDriver::setTarget(IPAddress ip, uint16_t port) {
   _targetIP = ip;
   _targetPort = port;

@@ -49,6 +49,24 @@ IPAddress NetworkManager::getLocalIP() {
   return IPAddress(0, 0, 0, 0);
 }
 
+IPAddress NetworkManager::getSubnetMask() {
+  if (_driver)
+    return _driver->getSubnetMask();
+  return IPAddress(0, 0, 0, 0);
+}
+
+IPAddress NetworkManager::getGateway() {
+  if (_driver)
+    return _driver->getGateway();
+  return IPAddress(0, 0, 0, 0);
+}
+
+IPAddress NetworkManager::getDNS() {
+  if (_driver)
+    return _driver->getDNS();
+  return IPAddress(0, 0, 0, 0);
+}
+
 DriverType NetworkManager::getType() {
   if (_driver)
     return _driver->getType();

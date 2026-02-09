@@ -16,6 +16,9 @@ public:
   void update();
   bool isConnected();
   IPAddress getLocalIP();
+  IPAddress getSubnetMask();
+  IPAddress getGateway();
+  IPAddress getDNS();
   DriverType getType();
 
   // Voter Protocol specific

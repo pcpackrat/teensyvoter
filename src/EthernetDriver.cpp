@@ -111,6 +111,12 @@ bool EthernetDriver::isConnected() {
 
 IPAddress EthernetDriver::getLocalIP() { return Ethernet.localIP(); }
 
+IPAddress EthernetDriver::getSubnetMask() { return Ethernet.subnetMask(); }
+
+IPAddress EthernetDriver::getGateway() { return Ethernet.gatewayIP(); }
+
+IPAddress EthernetDriver::getDNS() { return Ethernet.dnsServerIP(); }
+
 void EthernetDriver::setTarget(IPAddress ip, uint16_t port) {
   _targetIP = ip;
   _targetPort = port;

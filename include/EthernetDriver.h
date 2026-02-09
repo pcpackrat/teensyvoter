@@ -19,6 +19,9 @@ public:
   // Status
   virtual bool isConnected() override;
   virtual IPAddress getLocalIP() override;
+  virtual IPAddress getSubnetMask() override;
+  virtual IPAddress getGateway() override;
+  virtual IPAddress getDNS() override;
   virtual DriverType getType() override { return DRIVER_ETHERNET; }
 
   // Data

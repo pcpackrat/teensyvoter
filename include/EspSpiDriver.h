@@ -22,6 +22,9 @@ public:
   void update() override;
   bool isConnected() override;
   IPAddress getLocalIP() override;
+  IPAddress getSubnetMask() override;
+  IPAddress getGateway() override;
+  IPAddress getDNS() override;
   DriverType getType() override { return DRIVER_WIFI_SPI; }
 
   void setTarget(IPAddress ip, uint16_t port) override;

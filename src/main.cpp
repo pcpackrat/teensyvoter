@@ -13,8 +13,10 @@
 #include <Audio.h>
 #include <NativeEthernet.h>
 #include <SPI.h>
+#include <TimeLib.h>
 #include <Wire.h>
 #include <arm_math.h> // CMSIS DSP Library for FIR decimator
+
 
 #include "ConfigManager.h"
 #include "DSPProcessor.h"
@@ -40,6 +42,10 @@ uint16_t g_digitalGainPct = 100; // Default 100% (Unity)
 bool g_testToneMode = false; // If true, send 1kHz test tone
 int g_forcedRSSI = -1;       // -1 = Disabled, 0-255 = Force Value
 float g_testTonePhase = 0.0f;
+
+// Status Globals (for Web Interface)
+volatile uint8_t g_currentRSSI = 0;
+volatile bool g_cosActive = false;
 
 // CMSIS FIR Decimator for 44.1kHz -> 8kHz (factor ~5.5)
 // We'll use decimation factor of 6 (44.1kHz / 6 = 7.35kHz, close enough)
@@ -113,7 +119,6 @@ void setup() {
 
   // Load Config
   cfg.begin();
-  cfg.load();
 
   // Print Config
   Serial.println("--- Configuration ---");
@@ -357,6 +362,7 @@ enum MenuState {
   MENU_MAIN,
   MENU_STATUS,
   MENU_NETWORK,
+  MENU_VOTER_CONFIG,
   MENU_RADIO_CONFIG,
   MENU_DEBUG
 };
@@ -525,6 +531,7 @@ void printMenu() {
     Serial.println(" [2] Network Menu >>");
     Serial.println(" [3] Radio Config Menu >>");
     Serial.println(" [4] Debug Menu >>");
+    Serial.println(" [5] Voter Config Menu >>");
     Serial.println("----------------------------------------");
     Serial.println(" [S] Save & Reboot");
     Serial.println(" [M] Refresh Menu");
@@ -566,7 +573,11 @@ void printMenu() {
     if (gps.isTimeSet()) {
       VTIME t;
       gps.getNetworkTime(&t);
-      Serial.printf(" Voter Time   : %u.%09u\r\n", t.vtime_sec, t.vtime_nsec);
+      // Format: YYYY-MM-DD HH:MM:SS
+      time_t tt = (time_t)t.vtime_sec;
+      Serial.printf(" Voter Time   : %04d-%02d-%02d %02d:%02d:%02d UTC\r\n",
+                    year(tt), month(tt), day(tt), hour(tt), minute(tt),
+                    second(tt));
     }
     Serial.printf(" PPS Jitter   : %u us\r\n", gps.getPpsJitter());
     char lat[16], lon[16], elev[32];
@@ -582,67 +593,60 @@ void printMenu() {
     // Show active network type
     if (netMgr.getType() == DRIVER_ETHERNET) {
       Serial.println(" Network: Ethernet (NativeEthernet)");
-      IPAddress ip = netMgr.getLocalIP();
-      Serial.printf(" IP: %u.%u.%u.%u\r\n", ip[0], ip[1], ip[2], ip[3]);
     } else if (netMgr.getType() == DRIVER_WIFI_SPI) {
       Serial.println(" Network: WiFi (ESP32 SPI)");
-      IPAddress ip = netMgr.getLocalIP();
-      Serial.printf(" IP: %u.%u.%u.%u\r\n", ip[0], ip[1], ip[2], ip[3]);
     }
+
+    IPAddress ip = netMgr.getLocalIP();
+    IPAddress subnet = netMgr.getSubnetMask();
+    IPAddress gw = netMgr.getGateway();
+    IPAddress dns = netMgr.getDNS();
+
+    Serial.printf(" IP Address  : %u.%u.%u.%u\r\n", ip[0], ip[1], ip[2], ip[3]);
+    Serial.printf(" Subnet Mask : %u.%u.%u.%u\r\n", subnet[0], subnet[1],
+                  subnet[2], subnet[3]);
+    Serial.printf(" Gateway     : %u.%u.%u.%u\r\n", gw[0], gw[1], gw[2], gw[3]);
+    Serial.printf(" DNS Server  : %u.%u.%u.%u\r\n", dns[0], dns[1], dns[2],
+                  dns[3]);
     Serial.println("----------------------------------------");
-
-    // Consolidate Host Address Display
-    IPAddress hIP(cfg.data.hostIP);
-    if (cfg.data.hostname[0] != '\0') {
-      Serial.printf(" [3] Host Addr   : %s (Hostname)\r\n", cfg.data.hostname);
-    } else {
-      Serial.printf(" [3] Host Addr   : %u.%u.%u.%u (IP)\r\n", hIP[0], hIP[1],
-                    hIP[2], hIP[3]);
-    }
-
-    Serial.printf(" [4] Host Port   : %u\r\n", cfg.data.hostPort);
-    Serial.printf(" [5] Client PWD  : %s\r\n", cfg.data.clientPwd);
-    Serial.printf(" [6] Host PWD    : %s\r\n", cfg.data.hostPwd);
 
     // Ethernet static IP options (only show when using Ethernet)
     if (netMgr.getType() == DRIVER_ETHERNET) {
-      Serial.println("----------------------------------------");
-      Serial.printf(" [E] Use Static IP: %s\r\n",
+      Serial.printf(" [1] Use Static IP: %s\r\n",
                     cfg.data.useStaticIP ? "YES" : "NO (DHCP)");
       if (cfg.data.useStaticIP) {
         IPAddress sip(cfg.data.staticIP);
         IPAddress smask(cfg.data.subnetMask);
         IPAddress gw(cfg.data.gateway);
         IPAddress sdns(cfg.data.staticDNS);
-        Serial.printf(" [I] Static IP   : %u.%u.%u.%u\r\n", sip[0], sip[1],
+        Serial.printf(" [2] Static IP   : %u.%u.%u.%u\r\n", sip[0], sip[1],
                       sip[2], sip[3]);
-        Serial.printf(" [N] Subnet Mask : %u.%u.%u.%u\r\n", smask[0], smask[1],
+        Serial.printf(" [3] Subnet Mask : %u.%u.%u.%u\r\n", smask[0], smask[1],
                       smask[2], smask[3]);
-        Serial.printf(" [G] Gateway     : %u.%u.%u.%u\r\n", gw[0], gw[1], gw[2],
+        Serial.printf(" [4] Gateway     : %u.%u.%u.%u\r\n", gw[0], gw[1], gw[2],
                       gw[3]);
         if (sdns != IPAddress(0, 0, 0, 0)) {
-          Serial.printf(" [D] DNS Server  : %u.%u.%u.%u\r\n", sdns[0], sdns[1],
+          Serial.printf(" [5] DNS Server  : %u.%u.%u.%u\r\n", sdns[0], sdns[1],
                         sdns[2], sdns[3]);
         } else {
-          Serial.println(" [D] DNS Server  : (Use Gateway)");
+          Serial.println(" [5] DNS Server  : (Use Gateway)");
         }
       }
     }
 
     // WiFi-specific options (only show when using WiFi)
     if (netMgr.getType() == DRIVER_WIFI_SPI) {
-      Serial.println("----------------------------------------");
-      Serial.printf(" [W] WiFi SSID   : %s\r\n", cfg.data.wifiSSID);
-      Serial.println(" [P] Set WiFi Password");
+      Serial.printf(" [1] WiFi SSID   : %s\r\n", cfg.data.wifiSSID);
+      Serial.println(" [2] Set WiFi Password");
 
       IPAddress actualDNS = spiDriver.getDNSServer();
       IPAddress cfgDNS(cfg.data.dnsServerIP);
       if (cfg.data.dnsServerIP == 0) {
         Serial.printf(
-            " [D] DNS Server  : (DHCP default - Retrieved: %u.%u.%u.%u)\r\n",
+            " [3] DNS Server  : (DHCP default - Retrieved: %u.%u.%u.%u)\r\n",
             actualDNS[0], actualDNS[1], actualDNS[2], actualDNS[3]);
       } else {
-        Serial.printf(" [D] DNS Server  : %u.%u.%u.%u (Static)\r\n", cfgDNS[0],
+        Serial.printf(" [3] DNS Server  : %u.%u.%u.%u (Static)\r\n", cfgDNS[0],
                       cfgDNS[1], cfgDNS[2], cfgDNS[3]);
       }
       Serial.println(" [R] Resend WiFi Credentials to ESP32");
@@ -651,6 +655,28 @@ void printMenu() {
     Serial.println("----------------------------------------");
     Serial.println(" [S] Save & Reboot");
     Serial.println(" [x] Back to Main Menu");
+
+  } else if (g_menuState == MENU_VOTER_CONFIG) {
+    Serial.println("        VOTER CONFIGURATION");
+    Serial.println("========================================");
+
+    // Consolidate Host Address Display
+    IPAddress hIP(cfg.data.hostIP);
+    if (cfg.data.hostname[0] != '\0') {
+      Serial.printf(" [1] Host Addr   : %s (Hostname)\r\n", cfg.data.hostname);
+    } else {
+      Serial.printf(" [1] Host Addr   : %u.%u.%u.%u (IP)\r\n", hIP[0], hIP[1],
+                    hIP[2], hIP[3]);
+    }
+
+    Serial.printf(" [2] Host Port   : %u\r\n", cfg.data.hostPort);
+    Serial.printf(" [3] Client PWD  : %s\r\n", cfg.data.clientPwd);
+    Serial.printf(" [4] Host PWD    : %s\r\n", cfg.data.hostPwd);
+
+    Serial.println("----------------------------------------");
+    Serial.println(" [S] Save & Reboot");
+    Serial.println(" [x] Back to Main Menu");
+
   } else if (g_menuState == MENU_RADIO_CONFIG) {
     Serial.println("        RADIO CONFIGURATION");
     Serial.println("========================================");
@@ -732,6 +758,10 @@ void handleSerialCLI() {
         g_menuState = MENU_DEBUG;
         printMenu();
         break;
+      case '5':
+        g_menuState = MENU_VOTER_CONFIG;
+        printMenu();
+        break;
 
       // System
       case 's':
@@ -762,137 +792,97 @@ void handleSerialCLI() {
       }
     } else if (g_menuState == MENU_NETWORK) {
       switch (c) {
-      case '3': {
-        Serial.print("\r\nEnter Host Address (IP or Hostname): ");
-        String val = readStringEcho();
-        val.trim();
-        IPAddress ip;
-        if (ip.fromString(val)) {
-          // It's a valid IP
-          // Use direct cast instead of manual bit shifting to preserve byte
-          // order
-          cfg.data.hostIP = (uint32_t)ip;
-          // Clear hostname so IP takes precedence/shows in menu
-          cfg.setHostname("");
-          Serial.println("\r\n[Network] Set Host IP directly.");
-        } else {
-          // Treat as Hostname
-          if (val.length() < 64) {
-            cfg.setHostname(val.c_str());
+
+      // Ethernet Configuration
+      case '1':
+        if (netMgr.getType() == DRIVER_ETHERNET) {
+          cfg.data.useStaticIP = !cfg.data.useStaticIP;
+          Serial.printf("\r\n[Network] Static IP %s\r\n",
+                        cfg.data.useStaticIP ? "ENABLED" : "DISABLED");
+          if (cfg.data.useStaticIP) {
             Serial.println(
-                "\r\n[Network] Set Hostname. Will resolve on boot/save.");
+                "[Network] NOTE: Reboot required for changes to take effect");
           }
+          printMenu();
+        } else if (netMgr.getType() == DRIVER_WIFI_SPI) {
+          Serial.print("\r\nEnter WiFi SSID: ");
+          String s = readStringEcho();
+          s.trim();
+          if (s.length() < 32)
+            strcpy(cfg.data.wifiSSID, s.c_str());
+          printMenu();
         }
-        printMenu();
         break;
-      }
-      case '4': {
-        Serial.print("\r\nEnter Host Port: ");
-        cfg.data.hostPort = readStringEcho().toInt();
-        printMenu();
-        break;
-      }
-      case '5': {
-        Serial.print("\r\nEnter Client PWD: ");
-        String s = readStringEcho();
-        s.trim();
-        if (s.length() < 20)
-          strcpy(cfg.data.clientPwd, s.c_str());
-        printMenu();
-        break;
-      }
-      case '6': {
-        Serial.print("\r\nEnter Host PWD: ");
-        String s = readStringEcho();
-        s.trim();
-        if (s.length() < 20)
-          strcpy(cfg.data.hostPwd, s.c_str());
-        printMenu();
-        break;
-      }
-      case 'w':
-      case 'W': {
-        Serial.print("\r\nEnter WiFi SSID: ");
-        String s = readStringEcho();
-        s.trim();
-        if (s.length() < 32)
-          strcpy(cfg.data.wifiSSID, s.c_str());
-        printMenu();
-        break;
-      }
-      case 'p':
-      case 'P': {
-        Serial.print("\r\nEnter WiFi Pass: ");
-        String s = readStringEcho();
-        s.trim();
-        if (s.length() < 64)
-          strcpy(cfg.data.wifiPass, s.c_str());
-        printMenu();
-        break;
-      }
 
-      // Static IP configuration (Ethernet only)
-      case 'e':
-      case 'E': {
-        cfg.data.useStaticIP = !cfg.data.useStaticIP;
-        Serial.printf("\r\n[Network] Static IP %s\r\n",
-                      cfg.data.useStaticIP ? "ENABLED" : "DISABLED");
-        if (cfg.data.useStaticIP) {
-          Serial.println(
-              "[Network] NOTE: Reboot required for changes to take effect");
+      case '2':
+        if (netMgr.getType() == DRIVER_ETHERNET && cfg.data.useStaticIP) {
+          Serial.print("\r\nEnter Static IP: ");
+          String s = readStringEcho();
+          s.trim();
+          IPAddress ip;
+          if (ip.fromString(s)) {
+            cfg.data.staticIP = (uint32_t)ip;
+            Serial.println("\r\n[Network] Static IP updated");
+          } else {
+            Serial.println("\r\n[Network] Invalid IP address");
+          }
+          printMenu();
+        } else if (netMgr.getType() == DRIVER_WIFI_SPI) {
+          Serial.print("\r\nEnter WiFi Pass: ");
+          String s = readStringEcho();
+          s.trim();
+          if (s.length() < 64)
+            strcpy(cfg.data.wifiPass, s.c_str());
+          printMenu();
         }
-        printMenu();
         break;
-      }
-      case 'i':
-      case 'I': {
-        Serial.print("\r\nEnter Static IP: ");
-        String s = readStringEcho();
-        s.trim();
-        IPAddress ip;
-        if (ip.fromString(s)) {
-          cfg.data.staticIP = (uint32_t)ip;
-          Serial.println("\r\n[Network] Static IP updated");
-        } else {
-          Serial.println("\r\n[Network] Invalid IP address");
-        }
-        printMenu();
-        break;
-      }
-      case 'n':
-      case 'N': {
-        Serial.print("\r\nEnter Subnet Mask: ");
-        String s = readStringEcho();
-        s.trim();
-        IPAddress mask;
-        if (mask.fromString(s)) {
-          cfg.data.subnetMask = (uint32_t)mask;
-          Serial.println("\r\n[Network] Subnet mask updated");
-        } else {
-          Serial.println("\r\n[Network] Invalid subnet mask");
-        }
-        printMenu();
-        break;
-      }
-      case 'g':
-      case 'G': {
-        Serial.print("\r\nEnter Gateway IP: ");
-        String s = readStringEcho();
-        s.trim();
-        IPAddress gw;
-        if (gw.fromString(s)) {
-          cfg.data.gateway = (uint32_t)gw;
-          Serial.println("\r\n[Network] Gateway updated");
-        } else {
-          Serial.println("\r\n[Network] Invalid gateway address");
-        }
-        printMenu();
-        break;
-      }
 
-      case 'd':
-      case 'D': {
-        // DNS configuration - works for both WiFi and Ethernet static IP
+      case '3':
+        if (netMgr.getType() == DRIVER_ETHERNET && cfg.data.useStaticIP) {
+          Serial.print("\r\nEnter Subnet Mask: ");
+          String s = readStringEcho();
+          s.trim();
+          IPAddress mask;
+          if (mask.fromString(s)) {
+            cfg.data.subnetMask = (uint32_t)mask;
+            Serial.println("\r\n[Network] Subnet mask updated");
+          } else {
+            Serial.println("\r\n[Network] Invalid subnet mask");
+          }
+          printMenu();
+        } else if (netMgr.getType() == DRIVER_WIFI_SPI) {
+          // WiFi DNS
+          Serial.print(
+              "\r\nEnter DNS Server IP (or 0.0.0.0 for DHCP default): ");
+          String s = readStringEcho();
+          s.trim();
+          if (s.length() > 0) {
+            IPAddress dns;
+            if (dns.fromString(s)) {
+              cfg.data.dnsServerIP = (uint32_t)dns;
+            }
+          }
+          printMenu();
+        }
+        break;
+
+      case '4':
+        if (netMgr.getType() == DRIVER_ETHERNET && cfg.data.useStaticIP) {
+          Serial.print("\r\nEnter Gateway IP: ");
+          String s = readStringEcho();
+          s.trim();
+          IPAddress gw;
+          if (gw.fromString(s)) {
+            cfg.data.gateway = (uint32_t)gw;
+            Serial.println("\r\n[Network] Gateway updated");
+          } else {
+            Serial.println("\r\n[Network] Invalid gateway address");
+          }
+          printMenu();
+        }
+        break;
+
+      case '5':
         if (netMgr.getType() == DRIVER_ETHERNET && cfg.data.useStaticIP) {
           Serial.print("\r\nEnter DNS Server IP (or 0.0.0.0 to use gateway): ");
           String s = readStringEcho();
@@ -904,26 +894,67 @@ void handleSerialCLI() {
               Serial.println("\r\n[Network] Static DNS updated");
             }
           }
-        } else if (netMgr.getType() == DRIVER_WIFI_SPI) {
-          Serial.print(
-              "\r\nEnter DNS Server IP (or 0.0.0.0 for DHCP default): ");
-          String s = readStringEcho();
-          s.trim();
-          if (s.length() > 0) {
-            IPAddress dns;
-            if (dns.fromString(s)) {
-              cfg.data.dnsServerIP = (uint32_t)dns;
-            }
-          }
+          printMenu();
         }
-        printMenu();
         break;
-      }
+
       case 'r':
       case 'R':
         Serial.println("Resending Credentials...");
         spiDriver.setCredentials(cfg.data.wifiSSID, cfg.data.wifiPass);
         break;
+      case 's':
+      case 'S':
+        cfg.save();
+        Serial.println("\r\nSaving & Rebooting...");
+        delay(1000);
+        SCB_AIRCR = 0x05FA0004;
+        break;
+      }
+    } else if (g_menuState == MENU_VOTER_CONFIG) {
+      switch (c) {
+      case '1': {
+        Serial.print("\r\nEnter Host Address (IP or Hostname): ");
+        String val = readStringEcho();
+        val.trim();
+        IPAddress ip;
+        if (ip.fromString(val)) {
+          cfg.data.hostIP = (uint32_t)ip;
+          cfg.setHostname("");
+          Serial.println("\r\n[Voter] Set Host IP.");
+        } else {
+          if (val.length() < 64) {
+            cfg.setHostname(val.c_str());
+            Serial.println("\r\n[Voter] Set Hostname.");
+          }
+        }
+        printMenu();
+        break;
+      }
+      case '2': {
+        Serial.print("\r\nEnter Host Port: ");
+        cfg.data.hostPort = readStringEcho().toInt();
+        printMenu();
+        break;
+      }
+      case '3': {
+        Serial.print("\r\nEnter Client PWD: ");
+        String s = readStringEcho();
+        s.trim();
+        if (s.length() < 20)
+          strcpy(cfg.data.clientPwd, s.c_str());
+        printMenu();
+        break;
+      }
+      case '4': {
+        Serial.print("\r\nEnter Host PWD: ");
+        String s = readStringEcho();
+        s.trim();
+        if (s.length() < 20)
+          strcpy(cfg.data.hostPwd, s.c_str());
+        printMenu();
+        break;
+      }
       case 's':
       case 'S':
         cfg.save();
@@ -1405,6 +1436,20 @@ void loop() {
           finalRSSI = 0;
         break;
       }
+
+      // Update Global Status for Web Interface
+      g_currentRSSI = finalRSSI;
+      bool isCosActiveForStatus = false;
+      if (cfg.data.cosMode == COS_MODE_HARDWARE) {
+        isCosActiveForStatus =
+            (digitalRead(COS_PIN) == (cfg.data.cosInvert ? HIGH : LOW));
+      } else if (cfg.data.cosMode == COS_MODE_DSP) {
+        isCosActiveForStatus =
+            (dsp.getNoiseLevel() < cfg.data.dspSquelchThresh);
+      } else {
+        isCosActiveForStatus = true;
+      }
+      g_cosActive = isCosActiveForStatus;
 
       // FORCE Test Tone to send
       if (g_testToneMode) {
