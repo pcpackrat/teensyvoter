@@ -10,7 +10,10 @@ GPSManager::GPSManager() {
   _currentEpoch = 0;
   _validTime = false;
   _ppsPeriod = 1000000;
-  _lastLockStatus = GPS_NO_FIX;
+  _stableStatus = GPS_NO_FIX;
+  _pendingStatus = GPS_NO_FIX;
+  _pendingStartTime = 0;
+  _lastLoggedStatus = GPS_NO_FIX;
   _instance = this;
 }
 
@@ -86,9 +89,20 @@ void GPSManager::update() {
     }
   }
 
-  // 3. Track Status Transitions with detailed logging
-  GPSLockStatus currentStatus = getLockStatus();
-  if (currentStatus != _lastLockStatus) {
+  // 3. Track Status Transitions with 500ms Hysteresis
+  GPSLockStatus currentRaw = _getRawLockStatus();
+
+  if (currentRaw != _pendingStatus) {
+    _pendingStatus = currentRaw;
+    _pendingStartTime = now;
+  } else {
+    // Current raw matches pending - has it been stable for 500ms?
+    if (millis() - _pendingStartTime > 500) {
+      _stableStatus = currentRaw;
+    }
+  }
+
+  if (_stableStatus != _lastLoggedStatus) {
     const char *oldStr = "UNKNOWN";
     const char *newStr = "UNKNOWN";
 
@@ -107,8 +121,8 @@ void GPSManager::update() {
       }
     };
 
-    oldStr = statusToStr(_lastLockStatus);
-    newStr = statusToStr(currentStatus);
+    oldStr = statusToStr(_lastLoggedStatus);
+    newStr = statusToStr(_stableStatus);
 
     char ts[20];
     getTimestamp(ts);
@@ -116,17 +130,17 @@ void GPSManager::update() {
     Serial.printf("%s [GPS] Status Change: %s -> %s\r\n", ts, oldStr, newStr);
 
     // Provide specific context for why it dropped out
-    uint32_t ppsAge = now - _lastPpsMicros;
-    if (currentStatus == GPS_LOST_PPS) {
+    uint32_t ppsAge = (now >= _lastPpsMicros) ? (now - _lastPpsMicros) : 0;
+    if (_stableStatus == GPS_LOST_PPS) {
       Serial.printf(
           "%s [GPS] Context: PPS Timeout. Age: %u us (Limit: 5000000)\r\n", ts,
           ppsAge);
-    } else if (currentStatus == GPS_LOST_SERIAL) {
+    } else if (_stableStatus == GPS_LOST_SERIAL) {
       uint32_t age = _gpsParser.time.age();
       Serial.printf(
           "%s [GPS] Context: Serial Timeout. Age: %u ms (Limit: 10000)\r\n", ts,
           age);
-    } else if (currentStatus == GPS_LOCKED) {
+    } else if (_stableStatus == GPS_LOCKED) {
       if (_ppsPeriod < 5000000) {
         Serial.printf(
             "%s [GPS] Context: Fix Restored. Sats: %u, PPS Period: %u us\r\n",
@@ -137,7 +151,7 @@ void GPSManager::update() {
       }
     }
 
-    _lastLockStatus = currentStatus;
+    _lastLoggedStatus = _stableStatus;
   }
 }
 
@@ -158,14 +172,19 @@ void GPSManager::getTimestamp(char *buf) {
            millisPart);
 }
 
-bool GPSManager::isLocked() { return getLockStatus() == GPS_LOCKED; }
+bool GPSManager::isLocked() { return _stableStatus == GPS_LOCKED; }
 
-GPSManager::GPSLockStatus GPSManager::getLockStatus() {
+GPSManager::GPSLockStatus GPSManager::getLockStatus() { return _stableStatus; }
+
+GPSManager::GPSLockStatus GPSManager::_getRawLockStatus() {
   if (!_validTime) {
     return GPS_NO_FIX;
   }
 
-  bool ppsActive = (micros() - _lastPpsMicros) < 5000000;
+  uint32_t now = micros();
+  uint32_t ppsAge = (now >= _lastPpsMicros) ? (now - _lastPpsMicros) : 0;
+
+  bool ppsActive = ppsAge < 5000000;
   if (!ppsActive) {
     return GPS_LOST_PPS;
   }

@@ -62,7 +62,12 @@ private:
   static void _ppsISR();
   static GPSManager *_instance; // Singleton pointer for ISR
 
-  GPSLockStatus _lastLockStatus;
+  GPSLockStatus _stableStatus;
+  GPSLockStatus _pendingStatus;
+  uint32_t _pendingStartTime;
+  GPSLockStatus _lastLoggedStatus;
+
+  GPSLockStatus _getRawLockStatus();
   void _handlePPS();
 };
 
