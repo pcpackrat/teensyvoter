@@ -106,33 +106,52 @@ void GPSManager::update() {
       }
     };
 
-    oldStr = statusToStr(_lastLockStatus);
-    newStr = statusToStr(currentStatus);
+    char ts[20];
+    getTimestamp(ts);
 
-    Serial.printf("[GPS] Status Change: %s -> %s\r\n", oldStr, newStr);
+    Serial.printf("%s [GPS] Status Change: %s -> %s\r\n", ts, oldStr, newStr);
 
     // Provide specific context for why it dropped out
     if (currentStatus == GPS_LOST_PPS) {
       uint32_t age = micros() - _lastPpsMicros;
       Serial.printf(
-          "[GPS] Context: PPS Timeout. Age: %u us (Limit: 2000000)\r\n", age);
+          "%s [GPS] Context: PPS Timeout. Age: %u us (Limit: 5000000)\r\n", ts,
+          age);
     } else if (currentStatus == GPS_LOST_SERIAL) {
       uint32_t age = _gpsParser.time.age();
       Serial.printf(
-          "[GPS] Context: Serial Timeout. Age: %u ms (Limit: 5000)\r\n", age);
+          "%s [GPS] Context: Serial Timeout. Age: %u ms (Limit: 10000)\r\n", ts,
+          age);
     } else if (currentStatus == GPS_LOCKED) {
       if (_ppsPeriod < 5000000) {
         Serial.printf(
-            "[GPS] Context: Fix Restored. Sats: %u, PPS Period: %u us\r\n",
-            getSatellites(), _ppsPeriod);
+            "%s [GPS] Context: Fix Restored. Sats: %u, PPS Period: %u us\r\n",
+            ts, getSatellites(), _ppsPeriod);
       } else {
-        Serial.printf("[GPS] Context: Fix Restored. Sats: %u\r\n",
+        Serial.printf("%s [GPS] Context: Fix Restored. Sats: %u\r\n", ts,
                       getSatellites());
       }
     }
 
     _lastLockStatus = currentStatus;
   }
+}
+
+void GPSManager::getTimestamp(char *buf) {
+  if (!buf)
+    return;
+
+  VTIME vt;
+  getNetworkTime(&vt, false); // Get raw high-res time
+
+  time_t t = (time_t)vt.vtime_sec;
+  tmElements_t tm;
+  breakTime(t, tm);
+
+  uint32_t millisPart = (vt.vtime_nsec / 1000000);
+
+  snprintf(buf, 20, "[%02d:%02d:%02d.%03u]", tm.Hour, tm.Minute, tm.Second,
+           millisPart);
 }
 
 bool GPSManager::isLocked() { return getLockStatus() == GPS_LOCKED; }
@@ -142,12 +161,12 @@ GPSManager::GPSLockStatus GPSManager::getLockStatus() {
     return GPS_NO_FIX;
   }
 
-  bool ppsActive = (micros() - _lastPpsMicros) < 2000000;
+  bool ppsActive = (micros() - _lastPpsMicros) < 5000000;
   if (!ppsActive) {
     return GPS_LOST_PPS;
   }
 
-  bool serialActive = _gpsParser.time.age() < 5000;
+  bool serialActive = _gpsParser.time.age() < 10000;
   if (!serialActive) {
     return GPS_LOST_SERIAL;
   }

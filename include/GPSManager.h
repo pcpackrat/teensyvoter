@@ -42,6 +42,7 @@ public:
   // Location
   void getGPSStrings(char *lat, char *lon, char *elev);
   uint32_t getSatellites();
+  void getTimestamp(char *buf); // Returns "[HH:MM:SS.mmm]"
 
 private:
   Stream *_gpsSerial;

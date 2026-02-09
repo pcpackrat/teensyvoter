@@ -135,28 +135,35 @@ void VoterClient::update() {
         _gpsLostTime = millis();
       }
 
-      // Print "Unstable" warning only after 500ms of loss
+      // Print "Signal Lost" warning only after 500ms of loss
       if (!_hasWarnedGps && (millis() - _gpsLostTime > 500)) {
         _hasWarnedGps = true;
-        Serial.println("[Voter] GPS Lock Unstable... Debouncing...");
+        char ts[20];
+        _gps->getTimestamp(ts);
+        Serial.printf(
+            "%s [Voter] GPS Signal Lost! Entering 60s holdover mode...\r\n",
+            ts);
       }
 
-      // Only disconnect if lock is lost for > 2000ms
-      if (millis() - _gpsLostTime > 2000) {
+      // Only disconnect if lock is lost for > 60,000ms (1 minute)
+      if (millis() - _gpsLostTime > 60000) {
         GPSManager::GPSLockStatus status = _gps->getLockStatus();
-        Serial.print("[Voter] GPS Lock Lost! Reason: ");
+        char ts[20];
+        _gps->getTimestamp(ts);
+        Serial.printf("%s [Voter] Holdover Expired! GPS Lock Lost. Reason: ",
+                      ts);
         switch (status) {
         case GPSManager::GPS_NO_FIX:
           Serial.println("No Fix (Time Invalid)");
           break;
         case GPSManager::GPS_LOST_PPS:
-          Serial.println("PPS Lost (>2.0s)");
+          Serial.println("PPS Lost (>5.0s)");
           break;
         case GPSManager::GPS_LOST_SERIAL:
-          Serial.println("Serial Data Timeout (>5s)");
+          Serial.println("Serial Data Timeout (>10s)");
           break;
         case GPSManager::GPS_LOCKED:
-          Serial.println("Transient Glitch (Recovered?)");
+          Serial.println("Transient Glitch (Still locked?)");
           break;
         default:
           Serial.println("Unknown");
@@ -172,7 +179,9 @@ void VoterClient::update() {
       // Lock is valid - Reset debounce timer
       if (_gpsLostTime != 0) {
         if (_hasWarnedGps) {
-          Serial.printf("[Voter] GPS Lock Recovered! (Sats: %u)\r\n",
+          char ts[20];
+          _gps->getTimestamp(ts);
+          Serial.printf("%s [Voter] GPS Lock Recovered! (Sats: %u)\r\n", ts,
                         _gps->getSatellites());
         }
         _gpsLostTime = 0;
