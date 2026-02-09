@@ -263,9 +263,6 @@ int EspSpiDriver::parsePacket() {
       uint8_t lenLo = SPI.transfer(0x00);
       uint16_t len = (lenHi << 8) | lenLo;
 
-      // DEBUG:
-      // Serial.printf("[SPI] Status=0x%02X Len=%d\r\n", status, len);
-
       if (len > 0 && len < 512) {
         // Read Payload
         for (int i = 0; i < len; i++) {
@@ -279,8 +276,7 @@ int EspSpiDriver::parsePacket() {
         _rxLen = 0;
       }
     } else {
-      // DEBUG: No Data
-      // Serial.printf("[SPI] No Data (Status=0x%02X)\r\n", status);
+
       _rxLen = 0;
     }
 

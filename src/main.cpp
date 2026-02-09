@@ -30,18 +30,16 @@
 #define COS_PIN 41   // Hardware COS input (active HIGH/LOW depending on radio)
 #define PIN_DEBUG_TX 3 // Debug / oscilloscope pin
 #define PPS_PIN 2      // GPS PPS Input
-// #define WIFI_SERIAL Serial5 // REMOVED (Conflicted with GPS)
+
 #define GPS_SERIAL Serial1 // GPS Module RX/TX (Pins 0/1)
 
 // --- Global State ---
 float g_headphoneVol = 0.5f;
 uint16_t g_digitalGainPct = 100; // Default 100% (Unity)
-// bool g_noSignalMode = false;    // Removed
+
 bool g_testToneMode = false; // If true, send 1kHz test tone
 int g_forcedRSSI = -1;       // -1 = Disabled, 0-255 = Force Value
 float g_testTonePhase = 0.0f;
-// bool g_dspSilenceMode = false; // Removed
-// float g_postGain = 1.0f; // Default Post-Filter Gain (Removed)
 
 // CMSIS FIR Decimator for 44.1kHz -> 8kHz (factor ~5.5)
 // We'll use decimation factor of 6 (44.1kHz / 6 = 7.35kHz, close enough)
@@ -58,10 +56,6 @@ int16_t accumulationBuf[512]; // Circular-ish buffer for outgoing samples
 int accHead = 0;
 
 // --- Configuration (Managed by ConfigManager) ---
-// const char* CLIENT_PWD = "password"; (Removed)
-// const char* HOST_PWD   = "bloodhound";
-// IPAddress   HOST_IP(192, 168, 1, 100);
-// uint16_t    HOST_PORT = 1667;
 
 // --- Audio System ---
 AudioInputI2S i2s_in;
@@ -76,8 +70,6 @@ AudioConnection patchCord2(i2s_in, 1, mixer1, 1);
 // Monitor Output (Use Mixer Output so we hear what we send)
 AudioConnection patchCord4(mixer1, 0, i2s_out, 0);
 AudioConnection patchCord5(mixer1, 0, i2s_out, 1);
-// AudioConnection patchCord3(mixer1, 0, recordQueue, 0); // REPLACED by LPF
-// chain below
 
 AudioAnalyzePeak peak1;
 AudioConnection patchCordMeter(mixer1, 0, peak1, 0);
@@ -135,7 +127,6 @@ void setup() {
 
   // Init Menus
   // Init Menus
-  // Serial.println("[System] Press any key for Menu...");
 
   // 2. Audio Setup
   AudioMemory(60);
@@ -167,16 +158,11 @@ void setup() {
   Serial.println("[Audio] SGTL5000 & Queue Initialized");
   Serial.printf("[Audio] Applied RX Gain: %u\r\n", cfg.data.rxGain);
 
-  // Auto-correction removed to allow Gain 0
-  // if (cfg.data.rxGain == 0) ...
   sgtl5000_1.lineInLevel(cfg.data.rxGain);
 
   // Configure Anti-Aliasing Filter (3.6kHz Cutoff for 8kHz Sample Rate
   // compatibility)
   lpf1.setLowpass(0, 3600, 0.707);
-  lpf1.setLowpass(1, 3600,
-                  0.707); // Total 2 stages for steeper rolloff (24dB/oct)
-
   lpf1.setLowpass(1, 3600,
                   0.707); // Total 2 stages for steeper rolloff (24dB/oct)
 
@@ -338,9 +324,6 @@ void setup() {
   webServer.setConfig(&cfg);
   webServer.setSystemObjects(&netMgr, &voterClient, &gps);
   webServer.begin();
-  // IPAddress webIP = Ethernet.localIP();
-  // Serial.printf("[Web] Access at http://%u.%u.%u.%u\r\n", webIP[0], webIP[1],
-  //               webIP[2], webIP[3]);
 }
 
 // Helper for proper input echo

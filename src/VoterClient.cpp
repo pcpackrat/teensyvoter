@@ -262,14 +262,12 @@ void VoterClient::_sendGPSPacket() {
   // 2. Location Payload
   if (locked) {
     _gps->getGPSStrings(pkt.lat, pkt.lon, pkt.elev);
-    // Serial.printf("[Voter] Sending GPS: Lat=%s Lon=%s Alt=%s\r\n", pkt.lat,
-    // pkt.lon, pkt.elev);
+
   } else {
     // Empty strings or defaults
     strcpy((char *)pkt.lat, "0000.00N");
     strcpy((char *)pkt.lon, "00000.00W");
     strcpy((char *)pkt.elev, "000.0M");
-    // Serial.println("[Voter] Sending GPS (Unlocked - Default)");
   }
 
   // 3. Send
@@ -381,18 +379,6 @@ void VoterClient::processAudioFrame(uint8_t *ulawData, uint8_t rssi,
 
   // 1. Header Standard Fields
 
-  // DEBUG: Monitor Jitter (Time since last call)
-  static uint32_t lastCall = 0;
-  uint32_t nowMs = millis();
-  uint32_t diff = nowMs - lastCall;
-  lastCall = nowMs;
-
-  if (diff > 25 || diff < 15) {
-    // Serial.printf("[Jitter] Delta: %u ms (Target: 20ms)\r\n", diff);
-    // Serial.printf("[Voter] Heartbeat: RSSI=%u JitterDelta=%u\r\n", pkt.rssi,
-    // jitterDelta);
-  }
-
   if (_gps && _gps->isLocked()) {
     pkt.header.curtime = frameTime;
   } else {
@@ -421,16 +407,6 @@ void VoterClient::processAudioFrame(uint8_t *ulawData, uint8_t rssi,
   pkt.rssi = rssi;
   // pkt.audio is FRAME_SIZE (160 bytes)
   memcpy(pkt.audio, ulawData, FRAME_SIZE);
-
-  // Debug: Print RSSI value every 50 packets (1 second)
-  /*
-  static int pktCount = 0;
-  if (++pktCount >= 50) {
-    Serial.printf("[Voter] Heartbeat: RSSI=%u JitterDelta=%u\r\n", pkt.rssi,
-                  diff);
-    pktCount = 0;
-  }
-  */
 
   // 3. Send
   _net->sendPacket((uint8_t *)&pkt, sizeof(pkt));
