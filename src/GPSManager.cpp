@@ -194,8 +194,9 @@ GPSManager::GPSLockStatus GPSManager::_getRawLockStatus() {
     return GPS_LOST_SERIAL;
   }
 
-  // REQUIRE STABLE LOCK: At least 4 satellites for connection
-  if (_gpsParser.satellites.value() < 4) {
+  // REQUIRE STABLE LOCK: At least 3 satellites for connection (2D fix is enough
+  // for time)
+  if (_gpsParser.satellites.value() < 3) {
     return GPS_NO_FIX;
   }
 
