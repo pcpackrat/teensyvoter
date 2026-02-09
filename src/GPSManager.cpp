@@ -50,6 +50,7 @@ void GPSManager::begin(Stream *serialPort, uint8_t ppsPin) {
 }
 
 void GPSManager::update() {
+  uint32_t now = micros();
   // 1. Parse Serial Data
   while (_gpsSerial && _gpsSerial->available() > 0) {
     _gpsParser.encode(_gpsSerial->read());
@@ -106,17 +107,20 @@ void GPSManager::update() {
       }
     };
 
+    oldStr = statusToStr(_lastLockStatus);
+    newStr = statusToStr(currentStatus);
+
     char ts[20];
     getTimestamp(ts);
 
     Serial.printf("%s [GPS] Status Change: %s -> %s\r\n", ts, oldStr, newStr);
 
     // Provide specific context for why it dropped out
+    uint32_t ppsAge = now - _lastPpsMicros;
     if (currentStatus == GPS_LOST_PPS) {
-      uint32_t age = micros() - _lastPpsMicros;
       Serial.printf(
           "%s [GPS] Context: PPS Timeout. Age: %u us (Limit: 5000000)\r\n", ts,
-          age);
+          ppsAge);
     } else if (currentStatus == GPS_LOST_SERIAL) {
       uint32_t age = _gpsParser.time.age();
       Serial.printf(
