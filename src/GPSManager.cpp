@@ -168,8 +168,8 @@ void GPSManager::getTimestamp(char *buf) {
 
   uint32_t millisPart = (vt.vtime_nsec / 1000000);
 
-  snprintf(buf, 20, "[%02d:%02d:%02d.%03u]", tm.Hour, tm.Minute, tm.Second,
-           millisPart);
+  snprintf(buf, 20, "[%02d:%02d:%02d.%03lu]", tm.Hour, tm.Minute, tm.Second,
+           (unsigned long)millisPart);
 }
 
 bool GPSManager::isLocked() { return _stableStatus == GPS_LOCKED; }
@@ -284,8 +284,9 @@ void GPSManager::getGPSStrings(char *lat, char *lon, char *elev) {
     snprintf(lon, 10, "%03d%05.2f%c", deg, mins, ew);
   }
   if (elev) {
-    // Format: EEEEE.e (Meters)
-    double alt = _gpsParser.altitude.meters();
-    snprintf(elev, 7, "%05.1f", alt);
+    // Format: "M.m m / F ft"
+    double m = _gpsParser.altitude.meters();
+    double ft = m * 3.28084;
+    snprintf(elev, 32, "%.1f m / %.0f ft", m, ft);
   }
 }

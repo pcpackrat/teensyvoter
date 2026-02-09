@@ -338,7 +338,7 @@ void setup() {
   webServer.setConfig(&cfg);
   webServer.setSystemObjects(&netMgr, &voterClient, &gps);
   webServer.begin();
-  IPAddress webIP = Ethernet.localIP();
+  // IPAddress webIP = Ethernet.localIP();
   // Serial.printf("[Web] Access at http://%u.%u.%u.%u\r\n", webIP[0], webIP[1],
   //               webIP[2], webIP[3]);
 }
@@ -586,9 +586,9 @@ void printMenu() {
       Serial.printf(" Voter Time   : %u.%09u\r\n", t.vtime_sec, t.vtime_nsec);
     }
     Serial.printf(" PPS Jitter   : %u us\r\n", gps.getPpsJitter());
-    char lat[16], lon[16], elev[16];
+    char lat[16], lon[16], elev[32];
     gps.getGPSStrings(lat, lon, elev);
-    Serial.printf(" Location     : %s, %s (Elev: %s m)\r\n", lat, lon, elev);
+    Serial.printf(" Location     : %s, %s (Elev: %s)\r\n", lat, lon, elev);
     Serial.println("----------------------------------------");
     Serial.println(" [R] Refresh GPS Data");
     Serial.println(" [x] Back to Main Menu");
