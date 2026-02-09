@@ -574,10 +574,8 @@ void printMenu() {
       }
     }
 
-    Serial.printf(" Host PWD     : %s (%s)\r\n", cfg.data.hostPwd,
-                  hostPwdStatus);
-    Serial.printf(" Voter PWD    : %s (%s)\r\n", cfg.data.clientPwd,
-                  clientPwdStatus);
+    Serial.printf(" Host PWD     : %s\r\n", hostPwdStatus);
+    Serial.printf(" Voter PWD    : %s\r\n", clientPwdStatus);
     Serial.println(" -- GPS Status --");
     Serial.printf(" Locked       : %s\r\n", gps.isLocked() ? "YES" : "NO");
     Serial.printf(" Satellites   : %u\r\n", gps.getSatellites());
