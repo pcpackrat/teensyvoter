@@ -17,7 +17,6 @@
 #include <Wire.h>
 #include <arm_math.h> // CMSIS DSP Library for FIR decimator
 
-
 #include "ConfigManager.h"
 #include "DSPProcessor.h"
 #include "EspSpiDriver.h"
@@ -28,8 +27,9 @@
 #include "VoterProtocol.h"
 #include "WebServer.h"
 
-#define RSSI_PIN A14 // Connect to voltage divider output (0-3.3V)
-#define COS_PIN 41   // Hardware COS input (active HIGH/LOW depending on radio)
+#define RSSI_PIN 38 // A14 - Connect to voltage divider output (0-3.3V)
+#define COS_PIN 41  // Hardware COS input (active HIGH/LOW depending on radio)
+#define PTT_PIN 40  // PTT Output (Active LOW/HIGH configurable)
 #define PIN_DEBUG_TX 3 // Debug / oscilloscope pin
 #define PPS_PIN 2      // GPS PPS Input
 
