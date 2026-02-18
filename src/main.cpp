@@ -67,7 +67,8 @@ int accHead = 0;
 AudioInputI2S i2s_in;
 AudioMixer4 mixer1;
 AudioRecordQueue recordQueue;
-AudioOutputI2S i2s_out; // Defined before connections
+AudioPlayQueue playQueue; // Playback Queue (Jitter Buffer Output)
+AudioOutputI2S i2s_out;   // Defined before connections
 
 AudioConnection patchCord1(i2s_in, 0, mixer1, 0); // L -> Mixer
 // Right Channel (Unfiltered for now, or unused)
@@ -84,6 +85,10 @@ AudioConnection patchCordMeter(mixer1, 0, peak1, 0);
 AudioFilterBiquad lpf1;
 AudioConnection patchCord3(mixer1, 0, lpf1, 0);        // Mixer -> LPF
 AudioConnection patchCordLPF(lpf1, 0, recordQueue, 0); // LPF -> RecordQueue
+
+// Playback Logic (JitterBuffer -> PlayQueue -> Mixer)
+AudioConnection patchCordPlay(playQueue, 0, mixer1,
+                              2); // PlayQueue -> Mixer Ch2
 
 AudioControlSGTL5000 sgtl5000_1;
 
@@ -158,6 +163,7 @@ void setup() {
   // Start Recording
   mixer1.gain(0, 1.0); // Left Channel (Unity Gain - Reference)
   mixer1.gain(1, 0.0); // Right Channel (MUTED - Floating Pin Noise)
+  mixer1.gain(2, 1.0); // Playback Channel (Unity Gain)
   recordQueue.begin();
 
   Serial.println("[Audio] SGTL5000 & Queue Initialized");
@@ -1270,6 +1276,19 @@ void loop() {
   voterClient.update();
   webServer.handleClient(); // Handle web requests
 
+  // Debug Jitter Buffer
+  static uint32_t lastJitterDebug = 0;
+  if (millis() - lastJitterDebug > 1000) {
+    lastJitterDebug = millis();
+    if (voterClient.jitterBuffer.available() > 0 ||
+        voterClient.jitterBuffer.isBuffering()) {
+      Serial.printf("[Jitter] Avail: %u, Space: %u, Buffering: %d\n",
+                    voterClient.jitterBuffer.available(),
+                    voterClient.jitterBuffer.space(),
+                    voterClient.jitterBuffer.isBuffering());
+    }
+  }
+
   // 2. Audio Processing Loop
   // Changed to 'if' to prevent starvation of GPS/Network if DSP is slow
   // We process up to 8 blocks per loop to ensure we drain the queue
@@ -1564,6 +1583,21 @@ void loop() {
       } else {
         accHead = 0;
       }
+    }
+  }
+
+  // --- Jitter Buffer Playback ---
+  // Only process if we have a full frame (20ms/160 samples) available from
+  // network AND we are not overrunning the audio memory (backpressure).
+  if (AudioMemoryUsage() < 40 && voterClient.jitterBuffer.available() >= 160) {
+    uint8_t uBus[160];
+    int16_t pcmBuf[160];
+
+    // Retrieve from Jitter Buffer
+    size_t read = voterClient.jitterBuffer.get(uBus, 160);
+    if (read == 160) {
+      dsp.decodeULaw(uBus, pcmBuf, 160);
+      dsp.upsampleAndPlay(pcmBuf, 160, playQueue);
     }
   }
 }

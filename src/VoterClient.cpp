@@ -346,6 +346,10 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
         _authAttempts = 0; // Success!
         _lastGPSSend = millis();
       }
+
+      if (type == PAYLOAD_ULAW) {
+        _handleProxyAudioPacket(data, len);
+      }
     }
   } else {
     // If Digest Mismatch AND it was an AUTH packet, it might be a challenge we
@@ -361,10 +365,20 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
             "[Voter] Authentication Failed: Password Mismatch. Please "
             "check your Voter and Host passwords.");
       }
-      // DO NOT resend here! Let the 2-second retry loop in update() handle it.
       // This prevents a rapid-fire feedback loop between client and server.
     }
   }
+}
+
+void VoterClient::_handleProxyAudioPacket(const uint8_t *data, int len) {
+  if (len < (int)sizeof(PROXY_AUDIO_PACKET))
+    return;
+
+  PROXY_AUDIO_PACKET *pkt = (PROXY_AUDIO_PACKET *)data;
+
+  // Push audio to Jitter Buffer
+  // Note: pkt->audio is 160 bytes of uLaw
+  jitterBuffer.put(pkt->audio, FRAME_SIZE);
 }
 
 void VoterClient::processAudioFrame(uint8_t *ulawData, uint8_t rssi,

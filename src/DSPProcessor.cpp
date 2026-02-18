@@ -1,11 +1,18 @@
 #include "DSPProcessor.h"
 #include "ConfigManager.h"
 #include <Arduino.h>
+#include <Audio.h> // For AudioPlayQueue
 #include <math.h>
 
 extern ConfigManager cfg; // Access global config
 
-DSPProcessor::DSPProcessor() { memset(_rssiState, 0, sizeof(_rssiState)); }
+DSPProcessor::DSPProcessor() {
+  memset(_rssiState, 0, sizeof(_rssiState));
+  _upsamplePhase = 0.0f;
+  _lastUpsampleVal = 0;
+  _reservoirLen = 0;
+  memset(_reservoir, 0, sizeof(_reservoir));
+}
 
 void DSPProcessor::begin() {
   // 1. Calculate Filter Coefficients (Convert Q15 to Float)
@@ -218,4 +225,119 @@ void DSPProcessor::encodeULaw(int16_t *input, uint8_t *output, int count) {
   for (int i = 0; i < count; i++) {
     output[i] = linear2ulaw(input[i]);
   }
+}
+
+static int16_t ulaw2linear(uint8_t u_val) {
+  const uint16_t MULAW_BIAS = 33;
+  u_val = ~u_val;
+
+  int t = ((u_val & 0x0F) << 3) + MULAW_BIAS;
+  t <<= ((unsigned)u_val & 0x70) >> 4;
+
+  return ((u_val & 0x80) ? (MULAW_BIAS - t) : (t - MULAW_BIAS));
+}
+
+void DSPProcessor::decodeULaw(uint8_t *input, int16_t *output, int count) {
+  for (int i = 0; i < count; i++) {
+    output[i] = ulaw2linear(input[i]);
+  }
+}
+
+void DSPProcessor::upsampleAndPlay(int16_t *input, int count,
+                                   AudioPlayQueue &queue) {
+  // 1. Combine Reservoir + New Input
+  // Max needed reservoir is small ( < 1 sample worth of output steps in input
+  // space? No, < 1 output block worth ) 128 output samples * (8000/44100) =
+  // ~23.2 input samples. So 32 is safe.
+
+  int totalLen = _reservoirLen + count;
+  // We need a scratch buffer.
+  // We can use _scratchBuffer (float) if we cast? No, strict aliasing.
+  // Use a local buffer on stack. 160+32 is small.
+  int16_t workBuf[200];
+  if (totalLen > 200)
+    totalLen = 200; // Protection
+
+  // Construct combined buffer
+  if (_reservoirLen > 0) {
+    memcpy(workBuf, _reservoir, _reservoirLen * sizeof(int16_t));
+  }
+  memcpy(workBuf + _reservoirLen, input, count * sizeof(int16_t));
+
+  // 2. Processing Loop
+  const float step = 8000.0f / 44100.0f;
+  const int BLOCK_SIZE = 128;
+
+  // We loop as long as we have enough input to fill a FULL output block.
+  // We need (128 - 1) * step input samples relative to current phase?
+  // Basically, if phase points to index X, we need input up to X + (127*step).
+  // Safest: Check if the LAST sample we would access is within bounds.
+  // last_idx = floor(_upsamplePhase + 127*step).
+  // If last_idx < totalLen, we are good.
+
+  while (true) {
+    // Check if we can satisfy a full block
+    float endPhase = _upsamplePhase + (float)(BLOCK_SIZE - 1) * step;
+    int endIdx = (int)ceil(endPhase); // Need sample at ceil if interpolating?
+                                      // Actually linear interp uses floor and
+                                      // floor+1. So we need floor(endPhase)+1.
+
+    if (endIdx + 1 >= totalLen) {
+      // Not enough input for a full block. Stop.
+      break;
+    }
+
+    // Get Output Buffer
+    int16_t *out = queue.getBuffer();
+    if (out == NULL) {
+      // Queue full. We must drop to maintain real-time.
+      // But we can't just return, we need to advance phase to consume the input
+      // time.
+      // Advance phase by 128 output samples worth of time.
+      _upsamplePhase += (float)BLOCK_SIZE * step;
+      continue; // Check loop condition again (might run out of input now)
+    }
+
+    // Generate Block
+    for (int i = 0; i < BLOCK_SIZE; i++) {
+      int idx = (int)_upsamplePhase;
+      float frac = _upsamplePhase - idx;
+
+      int16_t s1 = workBuf[idx];     // Safe by check above
+      int16_t s2 = workBuf[idx + 1]; // Safe by check above
+
+      // Linear Interpolation
+      out[i] = s1 + (int16_t)(frac * (s2 - s1));
+
+      _upsamplePhase += step;
+    }
+
+    queue.playBuffer();
+  }
+
+  // 3. Save Residue
+  // Current _upsamplePhase is relative to workBuf start.
+  // We want to discard used samples and keep the rest.
+  int consumed = (int)_upsamplePhase;
+  int remaining = totalLen - consumed;
+
+  if (remaining > 32) {
+    // Logic Error or massive gap?
+    // Just keep last 32?
+    // Shift consumed up.
+    consumed = totalLen - 32;
+    remaining = 32;
+    _upsamplePhase -= (float)consumed; // Adjust phase to new base
+  } else if (remaining < 0) {
+    remaining = 0;
+    _upsamplePhase = 0.0f;
+  } else {
+    _upsamplePhase -= (float)consumed;
+  }
+
+  // Save to reservoir
+  if (remaining > 0) {
+    memcpy(_reservoir, workBuf + consumed, remaining * sizeof(int16_t));
+  }
+  _reservoirLen = remaining;
 }

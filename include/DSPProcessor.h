@@ -10,6 +10,9 @@
 #define SAMPLE_RATE 8000.0f
 #define FFT_SIZE 256 // Need at least block size
 
+// Forward declaration
+class AudioPlayQueue;
+
 class DSPProcessor {
 public:
   DSPProcessor();
@@ -25,6 +28,12 @@ public:
 
   // Convert linear PCM to uLaw
   void encodeULaw(int16_t *input, uint8_t *output, int count);
+
+  // Convert uLaw to linear PCM
+  void decodeULaw(uint8_t *input, int16_t *output, int count);
+
+  // Upsample (8k -> 44.1k) and push to PlayQueue
+  void upsampleAndPlay(int16_t *input, int count, AudioPlayQueue &queue);
 
   // Get last measured noise level (0-255, higher = more noise)
   uint8_t getNoiseLevel() const { return _lastNoiseLevel; }
@@ -57,6 +66,12 @@ private:
 
   // De-emphasis Filter State
   float _deempState;
+
+  // Upsampler State
+  float _upsamplePhase;
+  int16_t _lastUpsampleVal;
+  int16_t _reservoir[32];
+  int _reservoirLen;
 
   // DC Blocker State
   float _prevIn;

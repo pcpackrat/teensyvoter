@@ -31,3 +31,17 @@ This strategy guarantees the server sees a stable, monotonic stream of 20ms pack
 ## 3. Delay Offset
 *   **Delay**: 180ms.
 *   `FinalTimestamp = CalculatedTimestamp - Delay`.
+
+## 4. Protocol Implementation Details (Voter2 Reference)
+
+Based on Voter2 developer feedback:
+
+*   **Packet Counter**:
+    *   This is a **free-running counter** that increments every **20ms**.
+    *   It counts up by 1 every 20ms starting from 0 at boot, regardless of whether packets are being transmitted or not.
+    *   If reception pauses for 1 second, the next received packet will have a counter value approximately +50 higher than the last packet.
+    *   **ADPCM Exception**: If using ADPCM (40ms transmission interval), the packet counter increments by **2** for each transmitted packet to align with the 20ms time base.
+
+*   **Timestamps**:
+    *   **Seconds**: Standard Unix time.
+    *   **Nanoseconds**: This field increments by **1** for every packet sent. It acts as a secondary sequence number rather than a precise sub-second timestamp.

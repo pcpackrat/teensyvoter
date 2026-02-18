@@ -2,6 +2,7 @@
 #define VOTER_CLIENT_H
 
 #include "GPSManager.h"
+#include "JitterBuffer.h"
 #include "NetworkManager.h"
 #include "VoterProtocol.h"
 #include <Arduino.h>
@@ -35,6 +36,10 @@ public:
   // Audio Input (called by Audio ISR or polling)
   void processAudioFrame(uint8_t *ulawData, uint8_t rssi, VTIME frameTime);
 
+  // Audio Output (TX)
+  JitterBuffer
+      jitterBuffer; // Public so main loop can feed it logic/read from it
+
   // Status
   bool isConnected() { return _state == VOTER_CONNECTED; }
   VoterState getState() { return _state; }
@@ -66,6 +71,7 @@ private:
   uint32_t _crc32(const uint8_t *buf1, const uint8_t *buf2);
   void _sendAuthPacket();
   void _handlePacket(const uint8_t *data, int len);
+  void _handleProxyAudioPacket(const uint8_t *data, int len);
   void _generateChallenge();
   void _sendGPSPacket();
   uint32_t _lastGPSSend;
