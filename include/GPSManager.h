@@ -26,6 +26,7 @@ public:
   bool isLocked(); // True if GPS_LOCKED
   GPSLockStatus getLockStatus();
   bool isTimeSet(); // True if we have valid UTC time
+  bool checkPPS();  // Returns true if PPS fired since last check (clears flag)
 
   // Time Retrieval
   // Fill the VTIME struct with the exact current network time

@@ -43,6 +43,14 @@ void GPSManager::_handlePPS() {
   }
 }
 
+bool GPSManager::checkPPS() {
+  if (_ppsTriggered) {
+    _ppsTriggered = false;
+    return true;
+  }
+  return false;
+}
+
 void GPSManager::begin(Stream *serialPort, uint8_t ppsPin) {
   _gpsSerial = serialPort;
   _ppsPin = ppsPin;
@@ -82,6 +90,14 @@ void GPSManager::update() {
       if (!_validTime || abs((int64_t)gpsTime - (int64_t)_currentEpoch) >= 1) {
         _currentEpoch = gpsTime;
         _validTime = true;
+
+        // CRITICAL SYNC FIX: If we just updated the epoch from NMEA (e.g. during holdover),
+        // we must also align _lastPpsMicros to the virtual second boundary.
+        // Otherwise, getNetworkTime() will add holdover seconds on top of this new epoch.
+        uint32_t age = _gpsParser.time.age();
+        noInterrupts();
+        _lastPpsMicros = micros() - (age * 1000);
+        interrupts();
 
         // Sync Teensy RTC as well
         Teensy3Clock.set(gpsTime);
@@ -284,9 +300,9 @@ void GPSManager::getGPSStrings(char *lat, char *lon, char *elev) {
     snprintf(lon, 10, "%03d%05.2f%c", deg, mins, ew);
   }
   if (elev) {
-    // Format: "M.m m / F ft"
+    // PIC REFERENCE: GPS Elevation is sent as a %4.1f meters string
     double m = _gpsParser.altitude.meters();
-    double ft = m * 3.28084;
-    snprintf(elev, 32, "%.1f m / %.0f ft", m, ft);
+    // Protocol buffer in PROXY_GPS_PACKET is exactly 7 bytes
+    snprintf(elev, 7, "%4.1f", m); 
   }
 }

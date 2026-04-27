@@ -1,4 +1,5 @@
 #include "WebServer.h"
+#include "Version.h"
 #include <Audio.h>
 
 // HTML stored in PROGMEM to save RAM
@@ -317,6 +318,11 @@ void WebServer::handleRoot(EthernetClient &client) {
       "      html += '<p><strong>Uptime:</strong> ' + Math.floor(data.uptime / "
       "3600) + 'h ' + Math.floor((data.uptime % 3600) / 60) + 'm ' + "
       "(data.uptime % 60) + 's</p>';");
+  client.println("      html += '<hr>';");
+  client.println("      html += '<p "
+                 "style=\"color:#bdc3c7;font-size:0.8em;text-align:center\">';");
+  client.println("      html += 'Firmware v' + data.firmware + '<br>';");
+  client.println("      html += 'Build: ' + data.build + '</p>';");
   client.println("      document.getElementById('status').innerHTML = html;");
   client.println("    })");
   client.println("    .catch(e => document.getElementById('status').innerHTML "
@@ -430,8 +436,14 @@ void WebServer::handleVoter(EthernetClient &client) {
   client.print(_config->data.hostPwd);
   client.println("\">");
 
-  client.println(
-      "<button type=\"submit\" class=\"btn\">Save & Reboot</button>");
+  // Radio Output Level
+  client.println("<label>Transmit Gain (0-100%):</label>");
+  client.print("<input type=\"range\" name=\"txgain\" min=\"0\" max=\"100\" value=\"");
+  client.print(_config->data.radioTxMasterGainPct);
+  client.println("\" oninput=\"this.nextElementSibling.value = this.value + '%'\" style=\"width:80%\">");
+  client.printf("<output>%u%%</output>", _config->data.radioTxMasterGainPct);
+
+  client.println("<button type=\"submit\" class=\"btn\">Save & Reboot</button>");
   client.println("</form>");
   client.println(
       "<p><small>Note: Changes require reboot to take effect</small></p>");
@@ -452,9 +464,17 @@ void WebServer::handleAudio(EthernetClient &client) {
   client.println("<label>RX Gain (0-15):</label>");
   client.print(
       "<input type=\"number\" name=\"rxgain\" min=\"0\" max=\"15\" value=\"");
-  client.print(_config->data.rxGain);
+  client.print(_config->data.radioRxAnalogGain);
   client.println("\">");
   client.println("<p><small>SGTL5000 Line Input Level</small></p>");
+
+  // TX Gain
+  client.println("<label>TX Gain (0-100%):</label>");
+  client.print("<input type=\"range\" name=\"txgain\" min=\"0\" max=\"100\" value=\"");
+  client.print(_config->data.radioTxMasterGainPct);
+  client.println("\" oninput=\"this.nextElementSibling.value = this.value + '%'\" style=\"width:80%\">");
+  client.printf("<output>%u%%</output>", _config->data.radioTxMasterGainPct);
+  client.println("<p><small>SGTL5000 Output Volume</small></p>");
 
   // RSSI Calibration (DSP)
   client.println("<label>RSSI Calibration Factor (DSP):</label>");
@@ -510,6 +530,21 @@ void WebServer::handleAudio(EthernetClient &client) {
   client.println("\">");
   client.println("<p><small>Used when COS Mode = DSP</small></p>");
 
+  // PTT Configuration
+  client.println("<h3>PTT (Transmit)</h3>");
+  client.println("<label class=\"checkbox\">");
+  client.print("<input type=\"checkbox\" name=\"pttinvert\" value=\"1\"");
+  if (_config->data.pttInvert)
+    client.print(" checked");
+  client.println(">Invert PTT Polarity (Standard: Active Low)</label>");
+
+  client.println("<label>PTT Tail (ms):</label>");
+  client.print(
+      "<input type=\"number\" name=\"ptttail\" min=\"0\" max=\"1000\" value=\"");
+  client.print(_config->data.pttTailMs);
+  client.println("\">");
+  client.println("<p><small>Keep radio keyed after audio ends</small></p>");
+
   // RSSI Configuration
   client.println("<h3>RSSI</h3>");
   client.println("<label class=\"checkbox\">");
@@ -557,8 +592,27 @@ void WebServer::handleSystem(EthernetClient &client) {
   sendHtmlHeader(client);
 
   client.println("<div class=\"card\">");
-  client.println("<h2>System</h2>");
-  client.println("<p>System page - Coming soon</p>");
+  client.println("<h2>System Information</h2>");
+  client.print("<p><strong>Firmware Version:</strong> v");
+  client.print(FIRMWARE_VERSION);
+  client.println("</p>");
+  client.print("<p><strong>Build Date:</strong> ");
+  client.print(BUILD_DATE);
+  client.print(" ");
+  client.print(BUILD_TIME);
+  client.println("</p>");
+  
+  uint32_t uptime = millis() / 1000;
+  client.print("<p><strong>Uptime:</strong> ");
+  client.print(uptime / 3600);
+  client.print("h ");
+  client.print((uptime % 3600) / 60);
+  client.print("m ");
+  client.print(uptime % 60);
+  client.println("s</p>");
+  
+  client.println("<hr>");
+  client.println("<p>Hardware: Teensy 4.1 + Audio Shield</p>");
   client.println("</div>");
 
   sendHtmlFooter(client);
@@ -677,7 +731,16 @@ void WebServer::handleApiStatus(EthernetClient &client) {
   client.println("\"");
   client.println("  },");
   client.print("  \"uptime\": ");
-  client.println(millis() / 1000);
+  client.print(millis() / 1000);
+  client.println(",");
+  client.print("  \"firmware\": \"");
+  client.print(FIRMWARE_VERSION);
+  client.println("\",");
+  client.print("  \"build\": \"");
+  client.print(BUILD_DATE);
+  client.print(" ");
+  client.print(BUILD_TIME);
+  client.println("\"");
   client.println("}");
 }
 
@@ -693,7 +756,7 @@ String WebServer::readRequestBody(EthernetClient &client, int contentLength) {
   body.reserve(contentLength);
 
   unsigned long timeout = millis() + 2000;
-  while (body.length() < contentLength && millis() < timeout) {
+  while (body.length() < (unsigned int)contentLength && millis() < timeout) {
     if (client.available()) {
       body += (char)client.read();
     }
@@ -818,6 +881,9 @@ void WebServer::handleVoterPost(EthernetClient &client, const String &body) {
   String portStr = getFormValue(body, "port");
   String clientPwd = getFormValue(body, "clientpwd");
   String hostPwd = getFormValue(body, "hostpwd");
+  String txGainStr = getFormValue(body, "txgain");
+  
+  if (txGainStr != "") _config->data.radioTxMasterGainPct = txGainStr.toInt();
 
   // Update config
   host.toCharArray(_config->data.hostname, sizeof(_config->data.hostname));
@@ -857,22 +923,28 @@ void WebServer::handleAudioPost(EthernetClient &client, const String &body) {
   String squelchStr = getFormValue(body, "squelch");
   String rssiMinStr = getFormValue(body, "rssimin");
   String rssiMaxStr = getFormValue(body, "rssimax");
+  String pttTailStr = getFormValue(body, "ptttail");
+  String txGainStr = getFormValue(body, "txgain");
 
   // Checkboxes (only present if checked)
+  String pttInvert = getFormValue(body, "pttinvert");
   String cosInvert = getFormValue(body, "cosinvert");
   String hwRssi = getFormValue(body, "hwrssi");
   String plFilter = getFormValue(body, "plfilter");
   String deemph = getFormValue(body, "deemph");
 
   // Update config
-  _config->data.rxGain = rxGainStr.toInt();
+  _config->data.radioRxAnalogGain = rxGainStr.toInt();
   _config->data.dspCalib = dspGainStr.toFloat();
   _config->data.inputSource = inputSourceStr.toInt();
   _config->data.cosMode = cosModeStr.toInt();
   _config->data.dspSquelchThresh = squelchStr.toInt();
   _config->data.rssiMin = rssiMinStr.toInt();
   _config->data.rssiMax = rssiMaxStr.toInt();
+  _config->data.pttTailMs = pttTailStr.toInt();
+  if (txGainStr != "") _config->data.radioTxMasterGainPct = txGainStr.toInt();
 
+  _config->data.pttInvert = (pttInvert == "1");
   _config->data.cosInvert = (cosInvert == "1");
   _config->data.useHwRSSI = (hwRssi == "1");
   _config->data.enablePLFilter = (plFilter == "1");
@@ -937,7 +1009,7 @@ void WebServer::handleExport(EthernetClient &client) {
   // Audio config
   client.println("  \"audio\": {");
   client.print("    \"rxGain\": ");
-  client.println(_config->data.rxGain);
+  client.println(_config->data.radioRxAnalogGain);
   client.println(",");
   client.print("    \"dspCalib\": ");
   client.println(_config->data.dspCalib);

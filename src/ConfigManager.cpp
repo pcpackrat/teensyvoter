@@ -41,7 +41,7 @@ void ConfigManager::resetDefaults() {
 
   // Default Host: 10.10.10.42 : 667
   data.hostname[0] = '\0'; // Empty hostname by default
-  data.hostIP = (uint32_t)IPAddress(10, 10, 10, 42);
+  data.hostIP = (uint32_t)IPAddress(10, 10, 10, 40);
   data.hostPort = 1667;
 
   strcpy(data.clientPwd, "teensy123");
@@ -51,10 +51,10 @@ void ConfigManager::resetDefaults() {
   data.dnsServerIP = 0; // Use DHCP default DNS
 
   // Static IP Configuration (Ethernet)
-  data.useStaticIP = false;                              // Default to DHCP
-  data.staticIP = (uint32_t)IPAddress(192, 168, 1, 177); // Fallback IP
+  data.useStaticIP = false;                             // Default to DHCP
+  data.staticIP = (uint32_t)IPAddress(10, 10, 50, 200); // Fallback IP
   data.subnetMask = (uint32_t)IPAddress(255, 255, 255, 0);
-  data.gateway = (uint32_t)IPAddress(192, 168, 1, 1);
+  data.gateway = (uint32_t)IPAddress(10, 10, 50, 1);
   data.staticDNS = 0; // Use gateway as DNS
 
   data.useHwRSSI = true;  // Default to Hardware RSSI (ADC checked good)
@@ -67,16 +67,26 @@ void ConfigManager::resetDefaults() {
   data.dspCalib = 50.0f; // Was 13.0f
 
   data.dspSquelchThresh = 30; // Default DSP squelch threshold
-  data.rxGain = 6;            // Default Gain (User found 5-6 good)
+
+  // Directional Defaults
+  data.radioRxAnalogGain = 6;    // Default Gain (Pre-amp)
+  data.radioRxDigitalGainPct = 100; // 100% = Unity
+  data.radioTxMasterGainPct = 50;  // 50% = Nominal
+
   data.inputSource = 0;       // Default to Line In (AUDIO_INPUT_LINEIN = 0)
 
   // DSP Filters (CRITICAL - were missing!)
   data.enablePLFilter =
       true; // Enable 300Hz HPF (blocks PL tones & low-freq noise)
   data.enableDeemp = true; // Enable de-emphasis (reduces high-freq noise)
+  data.timingOffsetMs = 0; // Default to actual sample time
+
+  // PTT Defaults
+  data.pttInvert = true; // Default: Active Low (Industry Standard)
+  data.pttTailMs = 500;  // Default: 500ms tail (Eliminates flickering/popping)
 
   save();
-  Serial.println("[Config] Reset to Defaults");
+  Serial.println("[Config] Reset to Defaults\r");
 }
 
 IPAddress ConfigManager::getHostIP() { return IPAddress(data.hostIP); }

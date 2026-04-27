@@ -36,10 +36,12 @@ public:
   // Tuning
   void setLatency(uint16_t ms);
 
-private:
+public:
   uint8_t _buffer[JITTER_BUF_SIZE];
   volatile size_t _head; // Write index
   volatile size_t _tail; // Read index
+
+private:
 
   // Jitter Handling
   bool _buffering;     // True if we are filling up, False if playing

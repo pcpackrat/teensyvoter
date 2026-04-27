@@ -26,26 +26,37 @@
 #include "VoterClient.h"
 #include "VoterProtocol.h"
 #include "WebServer.h"
+#include "Version.h"
 
 #define RSSI_PIN 38 // A14 - Connect to voltage divider output (0-3.3V)
 #define COS_PIN 41  // Hardware COS input (active HIGH/LOW depending on radio)
 #define PTT_PIN 40  // PTT Output (Active LOW/HIGH configurable)
-#define PIN_DEBUG_TX 3 // Debug / oscilloscope pin
-#define PPS_PIN 2      // GPS PPS Input
+#define PPS_PIN 2   // GPS PPS Input
 
 #define GPS_SERIAL Serial1 // GPS Module RX/TX (Pins 0/1)
 
 // --- Global State ---
 float g_headphoneVol = 0.5f;
-uint16_t g_digitalGainPct = 100; // Default 100% (Unity)
+// cfg.data.radioRxDigitalGainPct removed - replaced by cfg.data.radioRxDigitalGainPct
 
 bool g_testToneMode = false; // If true, send 1kHz test tone
 int g_forcedRSSI = -1;       // -1 = Disabled, 0-255 = Force Value
 float g_testTonePhase = 0.0f;
 
+// --- Debug Flags ---
+enum DebugFlags {
+  DEBUG_NONE = 0,
+  DEBUG_JITTER = 1 << 0,  // [J] Jitter Buffer & Audio Timing
+  DEBUG_NETWORK = 1 << 1, // [N] Network Packets (Future)
+  DEBUG_GPS = 1 << 2,     // [G] GPS Sync/PPS (Future)
+  DEBUG_DSP = 1 << 3      // [D] DSP Processing (Future)
+};
+uint32_t g_debugMask = DEBUG_NONE;
+
 // Status Globals (for Web Interface)
 volatile uint8_t g_currentRSSI = 0;
 volatile bool g_cosActive = false;
+static bool g_testToneActive = false; // Forced 1kHz transmit for testing
 
 // CMSIS FIR Decimator for 44.1kHz -> 8kHz (factor ~5.5)
 // We'll use decimation factor of 6 (44.1kHz / 6 = 7.35kHz, close enough)
@@ -65,30 +76,43 @@ int accHead = 0;
 
 // --- Audio System ---
 AudioInputI2S i2s_in;
-AudioMixer4 mixer1;
+AudioMixer4 mixerTX; // Mixed audio going to the TRANSMITTER (i2s_out)
+AudioMixer4 mixerRX; // Audio going to ASTERISK (recordQueue)
 AudioRecordQueue recordQueue;
 AudioPlayQueue playQueue; // Playback Queue (Jitter Buffer Output)
-AudioOutputI2S i2s_out;   // Defined before connections
+AudioOutputI2S i2s_out;
 
-AudioConnection patchCord1(i2s_in, 0, mixer1, 0); // L -> Mixer
-// Right Channel (Unfiltered for now, or unused)
-AudioConnection patchCord2(i2s_in, 1, mixer1, 1);
+AudioFilterBiquad hpf_playback; // Disabled for pure testing
+AudioFilterBiquad lpf_playback; // Disabled for pure testing
+AudioSynthWaveform sine1;      // Test Tone Generator
 
-// Monitor Output (Use Mixer Output so we hear what we send)
-AudioConnection patchCord4(mixer1, 0, i2s_out, 0);
-AudioConnection patchCord5(mixer1, 0, i2s_out, 1);
+// ==============================================
+// 1. RADIO RECEIVER -> ASTERISK (recordQueue)
+// ==============================================
+AudioConnection patchCord1(i2s_in, 0, mixerRX, 0);     // Left  Incoming Radio
+AudioConnection patchCord2(i2s_in, 1, mixerRX, 1);     // Right Incoming Radio
 
-AudioAnalyzePeak peak1;
-AudioConnection patchCordMeter(mixer1, 0, peak1, 0);
-
-// Anti-Aliasing Filter (LPF) before Downsampling
+// Anti-Aliasing Filter (LPF) before Downsampling and sending to Asterisk
 AudioFilterBiquad lpf1;
-AudioConnection patchCord3(mixer1, 0, lpf1, 0);        // Mixer -> LPF
-AudioConnection patchCordLPF(lpf1, 0, recordQueue, 0); // LPF -> RecordQueue
+AudioConnection patchCord3(mixerRX, 0, lpf1, 0);       // RX Mixer -> LPF
+AudioConnection patchCordLPF(lpf1, 0, recordQueue, 0); // LPF -> Network Queue
 
-// Playback Logic (JitterBuffer -> PlayQueue -> Mixer)
-AudioConnection patchCordPlay(playQueue, 0, mixer1,
-                              2); // PlayQueue -> Mixer Ch2
+// ==============================================
+// 2. ASTERISK (playQueue) -> RADIO TRANSMITTER (i2s_out)
+// ==============================================
+// Full Filtering: Strip hum and limit frequencies to standard 3.5kHz telecom quality
+AudioConnection patchCordP1(playQueue, 0, hpf_playback, 0); 
+AudioConnection patchCordP2(hpf_playback, 0, lpf_playback, 0);
+AudioConnection patchCordP3(lpf_playback, 0, mixerTX, 0); // Network Audio -> TX Mixer Ch0
+AudioConnection patchCordS1(sine1, 0, mixerTX, 1);        // Test Tone -> TX Mixer Ch1
+
+// Drive both L and R outputs of the I2S DAC with the TX Mixer
+AudioConnection patchCord4(mixerTX, 0, i2s_out, 0);
+AudioConnection patchCord5(mixerTX, 0, i2s_out, 1);
+
+// Connect the Peak Meter to the RX incoming audio so the UI shows actual radio squelch activity
+AudioAnalyzePeak peak1;
+AudioConnection patchCordMeter(mixerRX, 0, peak1, 0);
 
 AudioControlSGTL5000 sgtl5000_1;
 
@@ -122,8 +146,33 @@ void setup() {
   Serial.begin(9600);
   delay(100);
 
+  Serial.println("========================================");
+  Serial.print("TeensyVoter Firmware v");
+  Serial.println(FIRMWARE_VERSION);
+  Serial.print("Build Date: ");
+  Serial.print(BUILD_DATE);
+  Serial.print(" ");
+  Serial.println(BUILD_TIME);
+  Serial.println("========================================");
+  Serial.println();
+
   // Load Config
   cfg.begin();
+
+  // 1.1 Hardware I/O Setup
+  pinMode(PTT_PIN, OUTPUT_OPENDRAIN);
+  bool pttIdleState = cfg.data.pttInvert ? HIGH : LOW;
+  digitalWrite(PTT_PIN, pttIdleState); // Set to Idle (High-Impedance in OD mode)
+  Serial.printf("[PTT] Initializing Pin %d, Polarity: %s, Default State: %s\r\n",
+                PTT_PIN, cfg.data.pttInvert ? "Active Low" : "Active High",
+                pttIdleState ? "HIGH" : "LOW");
+  
+  // Debug Print Passwords
+  Serial.printf("[System] Voter Client Pwd: %s\r\n", cfg.data.clientPwd);
+  Serial.printf("[System] Voter Host Pwd:   %s\r\n", cfg.data.hostPwd);
+
+  pinMode(COS_PIN, (cfg.data.cosMode == COS_MODE_HARDWARE) ? INPUT_PULLUP : INPUT);
+  pinMode(RSSI_PIN, INPUT);
 
   // Print Config
   Serial.println("--- Configuration ---");
@@ -148,28 +197,60 @@ void setup() {
     Serial.println("[Audio] Check I2C pins and power.");
   }
 
-  sgtl5000_1.volume(g_headphoneVol);
+  sgtl5000_1.volume(0.8f); // Fixed master hardware volume
+  sgtl5000_1.lineOutLevel(13); // Fixed master output level
+  
+  // Configure Playback Filter Chain for Sub-Audible (CTCSS/PL) Support
+  // We must pass frequencies down to ~60Hz for PL tones, so we lower the HPF to 20Hz.
+  hpf_playback.setHighpass(0, 20.0f, 0.707f);
+  
+  // Set the Biquad to create a sharp 24dB/octave LPF
+  // This drastically reduces Catmull-Rom upsampling artifacts but leaves voice crisp
+  lpf_playback.setLowpass(0, 4000.0f, 0.707f);
+  lpf_playback.setLowpass(1, 4000.0f, 0.707f);
+
+  // Configure Test Tone Generator
+  sine1.begin(0.0f, 1000.0f, WAVEFORM_SINE); // Amplitude 0 by default, controlled via CLI
+  
+  // Apply Directional Gain Settings
+  // --- Radio TX (Teensy -> Radio) ---
+  // Scaling: 100% slider = 0.4 Magnitude (Safe limit for Motorola)
+  float masterTxGain = (float)cfg.data.radioTxMasterGainPct / 250.0f;
+  mixerTX.gain(0, masterTxGain * 5.0f); // 5.0x boost for Network audio 
+  mixerTX.gain(1, masterTxGain * 3.0f); // 3.0x for Test Tone so it plays loud
+
+  // --- Radio RX (Radio -> Teensy) ---
+  sgtl5000_1.lineInLevel(cfg.data.radioRxAnalogGain);
+  dsp.setRxDigitalGainPct(cfg.data.radioRxDigitalGainPct);
+
+  // Configure Hardware DSP (SGTL5000 hardware EQ disabled temporarily to debug tones)
+  // sgtl5000_1.audioPostProcessorEnable();
+  // sgtl5000_1.eqSelect(3); // 3 = GRAPHIC_EQUALIZER
+  // eqBands: bass (115Hz), mid_low (330Hz), mid (990Hz), mid_high (3kHz), treble (9.9kHz)
+  // sgtl5000_1.eqBands(0.0f, 3.0f, 5.0f, 2.0f, -8.0f);
+
+  // Only drive the Left channel to the I2S output (User is using 'Left Pin')
+  // To avoid ground loops or fighting drivers on mono-shorted cables.
+  // (Connections moved to global scope)
 
   // Enforce Clean Audio Setup
-  sgtl5000_1.adcHighPassFilterEnable();             // Remove DC Offset
-  sgtl5000_1.micGain(0);                            // FIXED: 0dB (Preamp OFF)
-  sgtl5000_1.autoVolumeControl(0, 0, 0, -18, 0, 0); // Disable AVC hard
+  // Enforce Absolute Silence
+  sgtl5000_1.adcHighPassFilterDisable();            // Try disabling HPF to stop "ringing"
+  sgtl5000_1.micGain(0);                            
+  sgtl5000_1.autoVolumeControl(0, 0, 0, -18, 0, 0); 
+  sgtl5000_1.lineInLevel(cfg.data.radioRxAnalogGain);
 
-  // Force LINE IN for Diagnostic Safety
-  sgtl5000_1.inputSelect(AUDIO_INPUT_LINEIN);
-
-  sgtl5000_1.lineInLevel(cfg.data.rxGain); // Line input level (0-15)
-
-  // Start Recording
-  mixer1.gain(0, 1.0); // Left Channel (Unity Gain - Reference)
-  mixer1.gain(1, 0.0); // Right Channel (MUTED - Floating Pin Noise)
-  mixer1.gain(2, 1.0); // Playback Channel (Unity Gain)
+  // Start Recording & Monitoring
+  mixerRX.gain(0, 1.0f); // Radio Mic In
+  mixerRX.gain(1, 0.0f); // Right unused
+  // Channel 2 (Network Playback) already has masterTxGain applied!! Do not reset to 1.0f here!
+  
   recordQueue.begin();
 
   Serial.println("[Audio] SGTL5000 & Queue Initialized");
-  Serial.printf("[Audio] Applied RX Gain: %u\r\n", cfg.data.rxGain);
+  Serial.printf("[Audio] Applied RX Gain: %u\r\n", cfg.data.radioRxAnalogGain);
 
-  sgtl5000_1.lineInLevel(cfg.data.rxGain);
+  sgtl5000_1.lineInLevel(cfg.data.radioRxAnalogGain);
 
   // Configure Anti-Aliasing Filter (3.6kHz Cutoff for 8kHz Sample Rate
   // compatibility)
@@ -217,16 +298,19 @@ void setup() {
     // Fallback to WiFi
     Serial.println("[Network] Falling back to WiFi (ESP32 SPI)...");
 
-    // Give ESP32 time to boot
-    Serial.println("[System] Waiting for ESP32 Boot (5s)...");
-    delay(5000);
-
-    // Send WiFi Credentials
-    Serial.println("[System] Sending WiFi Credentials...");
-    spiDriver.setCredentials(cfg.data.wifiSSID, cfg.data.wifiPass);
-
-    // Initialize WiFi driver
+    // Initialize WiFi driver (This completely hard-resets the ESP32 and starts the SPI bus)
     if (spiDriver.begin(mac)) {
+      // Give ESP32 time to boot AFTER the hardware reset
+      Serial.println("[System] Waiting for ESP32 Boot (5s)...");
+      delay(5000);
+
+      // Send WiFi Credentials (retry 3x to guarantee delivery across SPI slave arming gaps)
+      for (int attempt = 1; attempt <= 3; attempt++) {
+        Serial.printf("[System] Sending WiFi Credentials (attempt %d/3)...\r\n", attempt);
+        spiDriver.setCredentials(cfg.data.wifiSSID, cfg.data.wifiPass);
+        delay(200); // Allow ESP32 to process before next attempt
+      }
+
       netMgr.begin(&spiDriver, mac);
 
       // Wait for IP (up to 15s) with Audio Maintenance
@@ -247,6 +331,11 @@ void setup() {
           Serial.println(myIP);
           ipFound = true;
           networkReady = true;
+
+          // Push full config to ESP32 for its web server
+          delay(200); // Let ESP32 settle
+          spiDriver.pushConfig(&cfg.data, sizeof(cfg.data));
+
           break;
         }
 
@@ -377,7 +466,7 @@ MenuState g_menuState = MENU_MAIN;
 // --- Settings Export/Import ---
 void exportSettings() {
   Serial.println("\r\n# TeensyVoter Configuration Export");
-  Serial.printf("# Version: %u\r\n", CONFIG_VERSION);
+  Serial.printf("# Version: %u\r\n", 17);
   Serial.println("# Copy this output to save your settings");
   Serial.println("#");
 
@@ -398,7 +487,7 @@ void exportSettings() {
   Serial.printf("cosInvert=%d\r\n", cfg.data.cosInvert ? 1 : 0);
   Serial.printf("cosMode=%d\r\n", cfg.data.cosMode);
   Serial.printf("dspSquelchThresh=%d\r\n", cfg.data.dspSquelchThresh);
-  Serial.printf("rxGain=%d\r\n", cfg.data.rxGain);
+  Serial.printf("rxGain=%d\r\n", cfg.data.radioRxAnalogGain);
   Serial.printf("inputSource=%d\r\n", cfg.data.inputSource);
   Serial.printf("rssiMin=%d\r\n", cfg.data.rssiMin);
   Serial.printf("rssiMax=%d\r\n", cfg.data.rssiMax);
@@ -458,7 +547,7 @@ bool parseConfigLine(String line) {
   } else if (key == "dspSquelchThresh") {
     cfg.data.dspSquelchThresh = value.toInt();
   } else if (key == "rxGain") {
-    cfg.data.rxGain = value.toInt();
+    cfg.data.radioRxAnalogGain = value.toInt();
   } else if (key == "inputSource") {
     cfg.data.inputSource = value.toInt();
   } else if (key == "rssiMin") {
@@ -604,16 +693,20 @@ void printMenu() {
     }
 
     IPAddress ip = netMgr.getLocalIP();
-    IPAddress subnet = netMgr.getSubnetMask();
-    IPAddress gw = netMgr.getGateway();
-    IPAddress dns = netMgr.getDNS();
-
     Serial.printf(" IP Address  : %u.%u.%u.%u\r\n", ip[0], ip[1], ip[2], ip[3]);
-    Serial.printf(" Subnet Mask : %u.%u.%u.%u\r\n", subnet[0], subnet[1],
-                  subnet[2], subnet[3]);
-    Serial.printf(" Gateway     : %u.%u.%u.%u\r\n", gw[0], gw[1], gw[2], gw[3]);
-    Serial.printf(" DNS Server  : %u.%u.%u.%u\r\n", dns[0], dns[1], dns[2],
-                  dns[3]);
+
+    // Only show full IP config for Ethernet (WiFi SPI doesn't support subnet/gw queries)
+    if (netMgr.getType() == DRIVER_ETHERNET) {
+      IPAddress subnet = netMgr.getSubnetMask();
+      IPAddress gw = netMgr.getGateway();
+      IPAddress dns = netMgr.getDNS();
+      Serial.printf(" Subnet Mask : %u.%u.%u.%u\r\n", subnet[0], subnet[1],
+                    subnet[2], subnet[3]);
+      Serial.printf(" Gateway     : %u.%u.%u.%u\r\n", gw[0], gw[1], gw[2], gw[3]);
+      Serial.printf(" DNS Server  : %u.%u.%u.%u\r\n", dns[0], dns[1], dns[2],
+                    dns[3]);
+    }
+
     Serial.println("----------------------------------------");
 
     // Ethernet static IP options (only show when using Ethernet)
@@ -644,17 +737,6 @@ void printMenu() {
     if (netMgr.getType() == DRIVER_WIFI_SPI) {
       Serial.printf(" [1] WiFi SSID   : %s\r\n", cfg.data.wifiSSID);
       Serial.println(" [2] Set WiFi Password");
-
-      IPAddress actualDNS = spiDriver.getDNSServer();
-      IPAddress cfgDNS(cfg.data.dnsServerIP);
-      if (cfg.data.dnsServerIP == 0) {
-        Serial.printf(
-            " [3] DNS Server  : (DHCP default - Retrieved: %u.%u.%u.%u)\r\n",
-            actualDNS[0], actualDNS[1], actualDNS[2], actualDNS[3]);
-      } else {
-        Serial.printf(" [3] DNS Server  : %u.%u.%u.%u (Static)\r\n", cfgDNS[0],
-                      cfgDNS[1], cfgDNS[2], cfgDNS[3]);
-      }
       Serial.println(" [R] Resend WiFi Credentials to ESP32");
     }
 
@@ -696,9 +778,9 @@ void printMenu() {
       Serial.printf(" [3] DSP Squelch : %d\r\n", cfg.data.dspSquelchThresh);
     }
 
-    Serial.println(" -- Audio --");
-    Serial.printf(" [4] Hw Pre-Amp  : %d (0-15)\r\n", cfg.data.rxGain);
-    Serial.printf(" [5] Digital Gain: %d%%\r\n", g_digitalGainPct);
+    Serial.println(" -- Receive (Radio RX) --");
+    Serial.printf(" [4] Analog Gain : %d (0-15)\r\n", cfg.data.radioRxAnalogGain);
+    Serial.printf(" [5] Digital Gain: %d%%\r\n", cfg.data.radioRxDigitalGainPct);
     Serial.printf(" [6] Input Source: %s\r\n",
                   cfg.data.inputSource == AUDIO_INPUT_LINEIN ? "LINE IN"
                                                              : "MIC");
@@ -714,6 +796,13 @@ void printMenu() {
       Serial.printf(" [0] Calibration : Min=%d, Max=%d\r\n", cfg.data.rssiMin,
                     cfg.data.rssiMax);
     }
+
+    Serial.println(" -- Transmit (Radio TX) --");
+    Serial.printf(" [V] Master Gain : %d%%\r\n", cfg.data.radioTxMasterGainPct);
+    Serial.printf(" [P] Polarity    : %s\r\n", cfg.data.pttInvert ? "Active LOW" : "Active HIGH");
+    Serial.printf(" [L] Tail Timing : %u ms\r\n", cfg.data.pttTailMs);
+    Serial.printf(" [T] Test Tone   : %s\r\n", g_testToneActive ? "ON (PTT Keyed)" : "OFF");
+
     Serial.println("----------------------------------------");
     Serial.println(" [S] Save & Reboot");
     Serial.println(" [x] Back to Main Menu");
@@ -723,6 +812,13 @@ void printMenu() {
     Serial.printf(" [T] Test Tone    : %s\r\n", g_testToneMode ? "ON" : "OFF");
     Serial.printf(" [F] Force RSSI   : %d\r\n", g_forcedRSSI);
     Serial.println(" [D] Signal Monitor (Live Dashboard)");
+    Serial.println("----------------------------------------");
+    Serial.printf(" [J] Jitter Log   : %s\r\n",
+                  (g_debugMask & DEBUG_JITTER) ? "ON" : "OFF");
+    Serial.printf(" [N] Network Log  : %s\r\n",
+                  (g_debugMask & DEBUG_NETWORK) ? "ON" : "OFF");
+    Serial.printf(" [G] GPS Log      : %s\r\n",
+                  (g_debugMask & DEBUG_GPS) ? "ON" : "OFF");
     Serial.println("----------------------------------------");
     Serial.println(" [E] Export Settings");
     Serial.println(" [I] Import Settings");
@@ -995,23 +1091,21 @@ void handleSerialCLI() {
 
       // Audio
       case '4': {
-        Serial.print("\r\nEnter Pre-Amp (0-15): ");
+        Serial.print("\r\nEnter Analog RX Gain (0-15): ");
         int g = readStringEcho().toInt();
         if (g >= 0 && g <= 15) {
-          cfg.data.rxGain = g;
+          cfg.data.radioRxAnalogGain = (uint8_t)g;
           sgtl5000_1.lineInLevel(g);
         }
         printMenu();
         break;
       }
       case '5': {
-        Serial.print("\r\nEnter Digital Gain % (0-500): ");
+        Serial.print("\r\nEnter Digital RX Gain (0-200%): ");
         int g = readStringEcho().toInt();
-        if (g >= 0 && g <= 500) {
-          g_digitalGainPct = g;
-          float gainFactor = (float)g / 100.0f;
-          mixer1.gain(0, gainFactor);
-          mixer1.gain(1, gainFactor);
+        if (g >= 0 && g <= 200) {
+          cfg.data.radioRxDigitalGainPct = (uint8_t)g;
+          dsp.setRxDigitalGainPct(g);
         }
         printMenu();
         break;
@@ -1024,7 +1118,7 @@ void handleSerialCLI() {
         } else {
           cfg.data.inputSource = AUDIO_INPUT_LINEIN;
           sgtl5000_1.inputSelect(AUDIO_INPUT_LINEIN);
-          sgtl5000_1.lineInLevel(cfg.data.rxGain);
+          sgtl5000_1.lineInLevel(cfg.data.radioRxAnalogGain);
         }
         printMenu();
         break;
@@ -1058,6 +1152,44 @@ void handleSerialCLI() {
         }
         printMenu();
         break;
+      case 'v':
+      case 'V': {
+        Serial.print("\r\nEnter Master TX Gain (0-100%): ");
+        int g = readStringEcho().toInt();
+        if (g >= 0 && g <= 100) {
+          cfg.data.radioTxMasterGainPct = (uint8_t)g;
+          float masterTxGain = (float)g / 250.0f; // 100% -> 0.4
+          mixerTX.gain(0, masterTxGain * 5.0f); // Boosted Network Audio
+          mixerTX.gain(1, masterTxGain);        // Reference Tone
+        }
+        printMenu();
+        break;
+      }
+      case 't':
+      case 'T': {
+        g_testToneActive = !g_testToneActive;
+        if (g_testToneActive) {
+          sine1.amplitude(1.0f);
+          Serial.println("\r\n[TEST] 1kHz Sine Tone ON (PTT Active)");
+        } else {
+          sine1.amplitude(0.0f);
+          Serial.println("\r\n[TEST] 1kHz Sine Tone OFF");
+        }
+        printMenu();
+        break;
+      }
+      case 'p':
+      case 'P':
+        cfg.data.pttInvert = !cfg.data.pttInvert;
+        printMenu();
+        break;
+      case 'l':
+      case 'L': {
+        Serial.print("\r\nEnter PTT Tail (ms): ");
+        cfg.data.pttTailMs = (uint16_t)readStringEcho().toInt();
+        printMenu();
+        break;
+      }
       case 's':
       case 'S':
         cfg.save();
@@ -1097,6 +1229,24 @@ void handleSerialCLI() {
         Serial.printf("\r\n[DEBUG] Force RSSI set to: %d\r\n", g_forcedRSSI);
         printMenu();
         break;
+
+      // Debug Flags
+      case 'j':
+      case 'J':
+        g_debugMask ^= DEBUG_JITTER;
+        printMenu();
+        break;
+      case 'n':
+      case 'N':
+        g_debugMask ^= DEBUG_NETWORK;
+        printMenu();
+        break;
+      case 'g':
+      case 'G':
+        g_debugMask ^= DEBUG_GPS;
+        printMenu();
+        break;
+
       case 'd':
       case 'D': {
         Serial.println("\r\n--- Live Tuner (Press 'x' to Exit) ---");
@@ -1129,9 +1279,9 @@ void handleSerialCLI() {
             if (millis() - lastPrint > 100) {
               lastPrint = millis();
               Serial.print("\rGain: ");
-              Serial.print(cfg.data.rxGain);
+              Serial.print(cfg.data.radioRxAnalogGain);
               Serial.print(" | Dig: ");
-              Serial.print(g_digitalGainPct);
+              Serial.print(cfg.data.radioRxDigitalGainPct);
               Serial.print("% | Peak: ");
               Serial.print(localMax, 3);
               if (localMax > 0.95f)
@@ -1214,31 +1364,49 @@ void handleSerialCLI() {
             if (c == 'x' || c == 'X')
               break;
             if (c == ']') {
-              if (cfg.data.rxGain < 15) {
-                cfg.data.rxGain++;
-                sgtl5000_1.lineInLevel(cfg.data.rxGain);
+              if (cfg.data.radioRxAnalogGain < 15) {
+                cfg.data.radioRxAnalogGain++;
+                sgtl5000_1.lineInLevel(cfg.data.radioRxAnalogGain);
               }
             }
             if (c == '[') {
-              if (cfg.data.rxGain > 0) {
-                cfg.data.rxGain--;
-                sgtl5000_1.lineInLevel(cfg.data.rxGain);
+              if (cfg.data.radioRxAnalogGain > 0) {
+                cfg.data.radioRxAnalogGain--;
+                sgtl5000_1.lineInLevel(cfg.data.radioRxAnalogGain);
               }
             }
             if (c == '=') {
-              g_digitalGainPct += 10;
-              if (g_digitalGainPct > 500)
-                g_digitalGainPct = 500;
-              float gainFactor = (float)g_digitalGainPct / 100.0f;
-              mixer1.gain(0, gainFactor);
-              mixer1.gain(1, gainFactor);
+              cfg.data.radioRxDigitalGainPct += 10;
+              if (cfg.data.radioRxDigitalGainPct > 500)
+                cfg.data.radioRxDigitalGainPct = 500;
+              float gainFactor = (float)cfg.data.radioRxDigitalGainPct / 100.0f;
+              mixerRX.gain(0, gainFactor);
+              mixerRX.gain(1, gainFactor);
             }
             if (c == '-') {
-              if (g_digitalGainPct >= 10)
-                g_digitalGainPct -= 10;
-              float gainFactor = (float)g_digitalGainPct / 100.0f;
-              mixer1.gain(0, gainFactor);
-              mixer1.gain(1, gainFactor);
+              if (cfg.data.radioRxDigitalGainPct >= 10)
+                cfg.data.radioRxDigitalGainPct -= 10;
+              float gainFactor = (float)cfg.data.radioRxDigitalGainPct / 100.0f;
+              mixerRX.gain(0, gainFactor);
+              mixerRX.gain(1, gainFactor);
+            }
+            if (c == ')') {
+              if (cfg.data.radioTxMasterGainPct < 100) {
+                cfg.data.radioTxMasterGainPct += 1;
+                float masterTxGain = (float)cfg.data.radioTxMasterGainPct / 250.0f;
+                mixerTX.gain(0, masterTxGain * 5.0f);
+                mixerTX.gain(1, masterTxGain);
+                Serial.printf("\r\n[Audio] Radio TX Master: %u%%\r\n", cfg.data.radioTxMasterGainPct);
+              }
+            }
+            if (c == '(') {
+              if (cfg.data.radioTxMasterGainPct > 0) {
+                cfg.data.radioTxMasterGainPct -= 1;
+                float masterTxGain = (float)cfg.data.radioTxMasterGainPct / 250.0f;
+                mixerTX.gain(0, masterTxGain * 5.0f);
+                mixerTX.gain(1, masterTxGain);
+                Serial.printf("\r\n[Audio] Radio TX Master: %u%%\r\n", cfg.data.radioTxMasterGainPct);
+              }
             }
           }
         }
@@ -1255,10 +1423,7 @@ void loop() {
   static VoterState lastReportedState = VOTER_DISCONNECTED;
   VoterState currentState = voterClient.getState();
 
-  // Frame Counting State (Crucial for Audio Timestamps)
-  static uint32_t lastEpoch = 0;
-  static uint32_t baseNsec = 0;
-  static uint32_t framesSent = 0;
+  // Frame Counting
 
   if (currentState != lastReportedState) {
     if (currentState == VOTER_CONNECTED || currentState == VOTER_AUTH_ERROR) {
@@ -1272,20 +1437,145 @@ void loop() {
   handleSerialCLI();
 
   gps.update();
+  if (gps.checkPPS()) {
+    voterClient.alignTimestampPhase();
+  }
+
   netMgr.update();
+
+  // Handle ESP32 web server config commands (WiFi mode only)
+  if (spiDriver.hasConfigCmd()) {
+    uint8_t cmdBuf[256];
+    int cmdLen = spiDriver.readConfigCmd(cmdBuf, sizeof(cmdBuf));
+    if (cmdLen > 0) {
+      uint8_t subCmd = cmdBuf[0];
+      if (subCmd == CFG_CMD_SET_PARAM && cmdLen >= 4) {
+        uint8_t paramId = cmdBuf[1];
+        uint8_t valLen = cmdBuf[2];
+        uint8_t *val = &cmdBuf[3];
+        // Apply parameter
+        switch (paramId) {
+          case PARAM_HOST_IP:
+            if (valLen == 4) memcpy(&cfg.data.hostIP, val, 4);
+            break;
+          case PARAM_HOST_PORT:
+            if (valLen == 2) cfg.data.hostPort = (val[0] << 8) | val[1];
+            break;
+          case PARAM_HOSTNAME:
+            if (valLen < sizeof(cfg.data.hostname)) {
+              memset(cfg.data.hostname, 0, sizeof(cfg.data.hostname));
+              memcpy(cfg.data.hostname, val, valLen);
+            }
+            break;
+          case PARAM_CLIENT_PWD:
+            if (valLen < sizeof(cfg.data.clientPwd)) {
+              memset(cfg.data.clientPwd, 0, sizeof(cfg.data.clientPwd));
+              memcpy(cfg.data.clientPwd, val, valLen);
+            }
+            break;
+          case PARAM_HOST_PWD:
+            if (valLen < sizeof(cfg.data.hostPwd)) {
+              memset(cfg.data.hostPwd, 0, sizeof(cfg.data.hostPwd));
+              memcpy(cfg.data.hostPwd, val, valLen);
+            }
+            break;
+          case PARAM_WIFI_SSID:
+            if (valLen < sizeof(cfg.data.wifiSSID)) {
+              memset(cfg.data.wifiSSID, 0, sizeof(cfg.data.wifiSSID));
+              memcpy(cfg.data.wifiSSID, val, valLen);
+            }
+            break;
+          case PARAM_WIFI_PASS:
+            if (valLen < sizeof(cfg.data.wifiPass)) {
+              memset(cfg.data.wifiPass, 0, sizeof(cfg.data.wifiPass));
+              memcpy(cfg.data.wifiPass, val, valLen);
+            }
+            break;
+          case PARAM_RX_GAIN:
+            if (valLen == 1) cfg.data.radioRxAnalogGain = val[0];
+            break;
+          case PARAM_TX_GAIN_PCT:
+            if (valLen == 1) cfg.data.radioTxMasterGainPct = val[0];
+            break;
+          case PARAM_COS_MODE:
+            if (valLen == 1) cfg.data.cosMode = val[0];
+            break;
+          case PARAM_COS_INVERT:
+            if (valLen == 1) cfg.data.cosInvert = val[0];
+            break;
+          case PARAM_DSP_SQUELCH:
+            if (valLen == 1) cfg.data.dspSquelchThresh = val[0];
+            break;
+          case PARAM_USE_HW_RSSI:
+            if (valLen == 1) cfg.data.useHwRSSI = val[0];
+            break;
+          case PARAM_RSSI_MIN:
+            if (valLen == 2) cfg.data.rssiMin = (val[0] << 8) | val[1];
+            break;
+          case PARAM_RSSI_MAX:
+            if (valLen == 2) cfg.data.rssiMax = (val[0] << 8) | val[1];
+            break;
+          case PARAM_PL_FILTER:
+            if (valLen == 1) cfg.data.enablePLFilter = val[0];
+            break;
+          case PARAM_DEEMP:
+            if (valLen == 1) cfg.data.enableDeemp = val[0];
+            break;
+          case PARAM_PTT_INVERT:
+            if (valLen == 1) cfg.data.pttInvert = val[0];
+            break;
+          case PARAM_PTT_TAIL_MS:
+            if (valLen == 2) cfg.data.pttTailMs = (val[0] << 8) | val[1];
+            break;
+          case PARAM_DSP_CALIB:
+            if (valLen == 4) memcpy(&cfg.data.dspCalib, val, 4);
+            break;
+          case PARAM_INPUT_SOURCE:
+            if (valLen == 1) cfg.data.inputSource = val[0];
+            break;
+        }
+        Serial.printf("[WebCfg] SET_PARAM id=0x%02X len=%d\r\n", paramId, valLen);
+      } else if (subCmd == CFG_CMD_SAVE_REBOOT) {
+        Serial.println("[WebCfg] SAVE_REBOOT received! Saving...");
+        cfg.save();
+        delay(100);
+        SCB_AIRCR = 0x05FA0004; // Reboot Teensy
+      } else if (subCmd == CFG_CMD_REQUEST_CONFIG) {
+        // Rate limit config pushes to once every 10 seconds to avoid UDP collisions
+        static uint32_t lastPush = 0;
+        if (millis() - lastPush > 10000) {
+            lastPush = millis();
+            Serial.println("[WebCfg] Config request from ESP32 - Pushing...");
+            spiDriver.pushConfig(&cfg.data, sizeof(cfg.data));
+        }
+      }
+    }
+  }
+
   voterClient.update();
   webServer.handleClient(); // Handle web requests
 
   // Debug Jitter Buffer
   static uint32_t lastJitterDebug = 0;
-  if (millis() - lastJitterDebug > 1000) {
+  if ((g_debugMask & DEBUG_JITTER) && (millis() - lastJitterDebug > 1000)) {
     lastJitterDebug = millis();
     if (voterClient.jitterBuffer.available() > 0 ||
         voterClient.jitterBuffer.isBuffering()) {
-      Serial.printf("[Jitter] Avail: %u, Space: %u, Buffering: %d\n",
+      Serial.printf("[Jitter] Avail: %u, Space: %u, Buffering: %d\r\n",
                     voterClient.jitterBuffer.available(),
                     voterClient.jitterBuffer.space(),
                     voterClient.jitterBuffer.isBuffering());
+      
+      // Dump 16 bytes of the payload
+      Serial.print("[Jitter Payload Head] Hex: ");
+      uint8_t peekBuf[16];
+      int toPeek = voterClient.jitterBuffer.available();
+      if (toPeek > 16) toPeek = 16;
+      for(int i=0; i<toPeek; i++) {
+          uint8_t b = voterClient.jitterBuffer._buffer[(voterClient.jitterBuffer._tail + i) % JITTER_BUF_SIZE];
+          Serial.printf("%02X ", b);
+      }
+      Serial.println();
     }
   }
 
@@ -1476,103 +1766,41 @@ void loop() {
         // logic moved to before DSP
       }
 
-      bool shouldSend = (finalRSSI > 0);
-      if (shouldSend) {
-        // Use the proper client method which handles sequence, timestamp, and
-        // sending
-        VTIME frameTime = {0, 0};
-        if (gps.isTimeSet()) {
-          // STRICT FRAME COUNTING STRATEGY
-          // Decouples timestamp from micros() jitter/phase drift.
+      static int tailCount = 0;
+      bool isTransmitting = (finalRSSI > 0);
+      if (isTransmitting) {
+        tailCount = 10; // Send 200ms of tail packets on unkey
+      }
 
-          // CONTINUOUS FRAME COUNTING STRATEGY (Approved Plan)
-          // Fixes "Timestamp Jumps" caused by buffer lag resyncing to wall
-          // clock.
-
-          uint32_t currentEpoch = gps.getEpoch();
-
-          // Reset Condition:
-          // 1. First run (lastEpoch == 0)
-          // 2. Large Gap (Transmission restarted after silence/squelch)
-          //    We detect restart by checking if we "stopped" sending recently?
-          //    Actually, we can just check if 'framesSent' is 0 (we must ensure
-          //    it is reset when we STOP sending)
-
-          if (framesSent == 0) {
-            // Capture EXACT start time (Seconds + Nanoseconds)
-            // This preserves the phase offset between GPS PPS and Audio Start
-            VTIME t;
-            gps.getNetworkTime(&t);
-            lastEpoch = t.vtime_sec;
-            baseNsec = t.vtime_nsec;
-          }
-
-          // Compute Time: Base + Offset
-          // Use 64-bit math to prevent overflow of NSEC calculation
-          // Add the initial random phase offset (baseNsec) to the continuous
-          // frame count
-          uint64_t totalNsec =
-              (uint64_t)baseNsec +
-              ((uint64_t)framesSent * 20000000ULL); // 20ms per frame
-
-          uint32_t secOffset = (uint32_t)(totalNsec / 1000000000ULL);
-          uint32_t nsecRemainder = (uint32_t)(totalNsec % 1000000000ULL);
-
-          frameTime.vtime_sec = lastEpoch + secOffset;
-          frameTime.vtime_nsec = nsecRemainder;
-
-          // Deduct Fixed Delay (180ms) for Voter Receiver Buffer
-          uint32_t delayNs = 180000000;
-
-          if (frameTime.vtime_nsec >= delayNs) {
-            frameTime.vtime_nsec -= delayNs;
-          } else {
-            // Borrow from seconds
-            frameTime.vtime_sec--;
-            frameTime.vtime_nsec =
-                (1000000000 + frameTime.vtime_nsec) - delayNs;
-          }
-
-          // DRIFT GUARD: If we drift > 2 seconds from Real GPS Time, force a
-          // resync. This handles startup lags or long periods of silence where
-          // framesSent wasn't incrementing.
-          int32_t driftSec = (int32_t)(currentEpoch - frameTime.vtime_sec);
-          if (abs(driftSec) > 2) {
-            // Force Resync
-            lastEpoch = currentEpoch;
-            framesSent = 0;
-            // Re-calculate for this frame (recursive-ish, but simple linear
-            // calc is faster)
-            frameTime.vtime_sec = currentEpoch;
-            frameTime.vtime_nsec = 0;
-            // Apply delay
-            if (frameTime.vtime_nsec >= delayNs) {
-              frameTime.vtime_nsec -= delayNs;
-            } // Should not happen for 0
-            else {
-              frameTime.vtime_sec--;
-              frameTime.vtime_nsec = (1000000000 + 0) - delayNs;
-            }
-
-            // Debug print only if serial is open/fast enough?
-            // Serial.printf("[Time] Resync! Drift: %d s\r\n", driftSec);
-          }
+      if (isTransmitting || tailCount > 0) {
+        if (!isTransmitting) {
+          // Send "Tail Packet" with RSSI 0 to clear server decoder
+          finalRSSI = 0;
+          tailCount--;
         }
 
-        // FORCE RSSI Debug Override
-        if (g_forcedRSSI >= 0) {
+        // Hardcode standard -180ms delay offset 
+        // This physically perfectly aligns the timestamps with the Reference Voter hardware
+        // Without this bias, Teensy timestamps sit bleeding edge 'in the future' and get dropped!
+        voterClient.setTimingOffset(-180);
+        
+        VTIME frameTime = {0, 0};
+        if (gps.isTimeSet()) {
+          gps.getNetworkTime(&frameTime, true);
+        }
+
+        // FORCE RSSI Debug Override (only if we were actively transmitting)
+        if (g_forcedRSSI >= 0 && isTransmitting) {
           finalRSSI = (uint8_t)g_forcedRSSI;
         }
 
         voterClient.processAudioFrame(ulawFrame, finalRSSI, frameTime);
-        if (gps.isTimeSet()) {
-          framesSent++;
-        }
-        // Serial.println("[Test] Generated Audio Frame (Not Sent)");
       } else {
-        // Not sending, reset continuous counter so next start uses fresh epoch
-        framesSent = 0;
+        // Completely Idle - Do nothing.
       }
+
+      // Drive Free-Running Packet Counter per Authority / Voter2 Reference
+      voterClient.incrementPacketCounter();
 
       // Move remaining
       int remaining = accHead - 160;
@@ -1587,9 +1815,11 @@ void loop() {
   }
 
   // --- Jitter Buffer Playback ---
-  // Only process if we have a full frame (20ms/160 samples) available from
-  // network AND we are not overrunning the audio memory (backpressure).
-  if (AudioMemoryUsage() < 40 && voterClient.jitterBuffer.available() >= 160) {
+  // Allow JitterBuffer to manage its own hysteresis (buffering state) by requesting
+  // audio as long as the DMA playQueue needs it. We use 30 blocks (~87ms) as
+  // our low-watermark. If JitterBuffer is starved, it returns 0 and waits until
+  // 200ms is accumulated before returning 160 again.
+  if (AudioMemoryUsage() < 30) {
     uint8_t uBus[160];
     int16_t pcmBuf[160];
 
@@ -1599,5 +1829,20 @@ void loop() {
       dsp.decodeULaw(uBus, pcmBuf, 160);
       dsp.upsampleAndPlay(pcmBuf, 160, playQueue);
     }
+  }
+
+  // --- Hardware PTT Pin Drive (Host Inactivity Timer) ---
+  // We key the radio based on incoming network traffic from the host, 
+  // rather than the DAC output. This provides a natural ~200ms lead-time
+  // while the jitter buffer fills, preventing clipped audio and pops.
+  uint32_t lastHostAudio = voterClient.getLastHostAudioTime();
+  bool pttActive = (lastHostAudio > 0 && (millis() - lastHostAudio < cfg.data.pttTailMs)) || g_testToneActive;
+  bool pttPinState = cfg.data.pttInvert ? !pttActive : pttActive;
+  digitalWrite(PTT_PIN, pttPinState);
+
+  static bool lastReportedPtt = false;
+  if (pttActive != lastReportedPtt) {
+    // Serial debug removed as requested
+    lastReportedPtt = pttActive;
   }
 }

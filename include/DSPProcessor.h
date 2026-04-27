@@ -25,6 +25,8 @@ public:
   // enableDeemp: Low Pass (6dB/oct)
   // Returns: Calculated RSSI (0-255) based on Noise Floor
   uint8_t process(int16_t *samples, bool enablePLFilter, bool enableDeemp);
+  
+  void setRxDigitalGainPct(uint8_t pct) { _rxDigitalGain = (float)pct / 100.0f; }
 
   // Convert linear PCM to uLaw
   void encodeULaw(int16_t *input, uint8_t *output, int count);
@@ -68,7 +70,7 @@ private:
   float _deempState;
 
   // Upsampler State
-  float _upsamplePhase;
+  double _upsamplePhase;
   int16_t _lastUpsampleVal;
   int16_t _reservoir[32];
   int _reservoirLen;
@@ -80,6 +82,8 @@ private:
   // Helpers
   void _calculateCoeffs();
   uint8_t _calculateRSSI(float *fftMag, int bins);
+
+  float _rxDigitalGain; // Software boost for incoming audio (Radio -> Host)
 };
 
 #endif

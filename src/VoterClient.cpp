@@ -70,6 +70,14 @@ VoterClient::VoterClient() {
   _myDigest = 0;
   memset(_myChallenge, 0, sizeof(_myChallenge));
   memset(_serverChallenge, 0, sizeof(_serverChallenge));
+  _packetCounter = 0;
+  _seqOffset = 0;
+  _isTransmitting = false;
+  _timingOffsetMs = -180; // Default to Authority Value
+  _anchorActive = false;
+  _burstPacketCount = 0;
+  _gpSeq = 0;
+  _lastHostAudioTime = 0;
 }
 
 void VoterClient::begin(NetworkManager *net, GPSManager *gps, IPAddress host,
@@ -83,6 +91,7 @@ void VoterClient::begin(NetworkManager *net, GPSManager *gps, IPAddress host,
   _hostPwd = hostPwd;
 
   _generateChallenge();
+  _net->setTarget(_hostIP, _hostPort);
 }
 
 void VoterClient::update() {
@@ -194,6 +203,10 @@ void VoterClient::update() {
       _lastGPSSend = millis();
       _sendGPSPacket();
     }
+
+    if (_isTransmitting && (millis() - _lastCallTime > 200)) {
+      _isTransmitting = false;
+    }
   }
 }
 
@@ -212,6 +225,17 @@ uint32_t VoterClient::_crc32(const uint8_t *buf1, const uint8_t *buf2) {
   return ~oldcrc32;
 }
 
+void VoterClient::alignTimestampPhase() {
+  // Calculates the offset needed to force the effective sequence count
+  // to be a multiple of 50 (0ms) at this moment (PPS).
+  uint32_t mod = _packetCounter % 50;
+  if (mod == 0) {
+    _seqOffset = 0;
+  } else {
+    _seqOffset = 50 - mod;
+  }
+}
+
 void VoterClient::_generateChallenge() {
   memset(_myChallenge, 0, sizeof(_myChallenge));
   snprintf(_myChallenge, VOTER_CHALLENGE_LEN, "%lu",
@@ -223,11 +247,11 @@ void VoterClient::_sendAuthPacket() {
   VOTER_PACKET_HEADER header;
   memset(&header, 0, sizeof(header));
 
-  // Time
+  // Time: For General Purpose packets (Auth/GPS/Keepalive),
+  // vtime_nsec increments by 1 per packet (Voter2 Author Feedback)
   if (_gps && _gps->isLocked()) {
-    _gps->getNetworkTime(&header.curtime);
-    header.curtime.vtime_sec = my_htonl(header.curtime.vtime_sec);
-    header.curtime.vtime_nsec = my_htonl(header.curtime.vtime_nsec);
+    header.curtime.vtime_sec = my_htonl(_gps->getEpoch());
+    header.curtime.vtime_nsec = my_htonl(_gpSeq++);
   } // Else 0
 
   // Challenge
@@ -251,9 +275,9 @@ void VoterClient::_sendGPSPacket() {
   memset(&pkt, 0, sizeof(pkt));
 
   // 1. Header
-  _gps->getNetworkTime(&pkt.header.curtime);
-  pkt.header.curtime.vtime_sec = my_htonl(pkt.header.curtime.vtime_sec);
-  pkt.header.curtime.vtime_nsec = my_htonl(pkt.header.curtime.vtime_nsec);
+  // VOTER2 REFERENCE: GP packets use +1 increment in nsec field
+  pkt.header.curtime.vtime_sec = my_htonl(_gps->getEpoch());
+  pkt.header.curtime.vtime_nsec = my_htonl(_gpSeq++);
 
   memcpy(pkt.header.challenge, _myChallenge, VOTER_CHALLENGE_LEN);
   pkt.header.digest = my_htonl(_myDigest);
@@ -262,12 +286,11 @@ void VoterClient::_sendGPSPacket() {
   // 2. Location Payload
   if (locked) {
     _gps->getGPSStrings(pkt.lat, pkt.lon, pkt.elev);
-
   } else {
-    // Empty strings or defaults
+    // PIC behavior: empty/zero strings when no fix
     strcpy((char *)pkt.lat, "0000.00N");
     strcpy((char *)pkt.lon, "00000.00W");
-    strcpy((char *)pkt.elev, "000.0M");
+    strcpy((char *)pkt.elev, "  0.0 "); 
   }
 
   // 3. Send
@@ -375,6 +398,7 @@ void VoterClient::_handleProxyAudioPacket(const uint8_t *data, int len) {
     return;
 
   PROXY_AUDIO_PACKET *pkt = (PROXY_AUDIO_PACKET *)data;
+  _lastHostAudioTime = millis(); // Track network-layer activity for PTT
 
   // Push audio to Jitter Buffer
   // Note: pkt->audio is 160 bytes of uLaw
@@ -391,37 +415,60 @@ void VoterClient::processAudioFrame(uint8_t *ulawData, uint8_t rssi,
   PROXY_AUDIO_PACKET pkt;
   memset(&pkt, 0, sizeof(pkt));
 
-  // 1. Header Standard Fields
-
-  if (_gps && _gps->isLocked()) {
-    pkt.header.curtime = frameTime;
-  } else {
-    // Fallback: Dead Reckoning (Simulated Time)
-    static uint32_t simSec = 10000; // Arbitrary start
-    static uint32_t simNsec = 0;
-
-    simNsec += 20000000; // +20ms
-    if (simNsec >= 1000000000) {
-      simNsec -= 1000000000;
-      simSec++;
-    }
-
-    pkt.header.curtime.vtime_sec = simSec;
-    pkt.header.curtime.vtime_nsec = simNsec;
+  // --- Rule 1: Anchor Once (Authority Alignment) ---
+  // If this is the start of a transmission, capture current GPS time as anchor.
+  if (!_anchorActive || !_isTransmitting) {
+    _anchorSec = frameTime.vtime_sec;
+    _anchorNsec = frameTime.vtime_nsec;
+    _burstPacketCount = 0;
+    _anchorActive = true;
   }
+
+  // --- Rule 2: Count Frames (Continuous counting) ---
+  // CurrentTime = BaseEpoch + (FramesSent * 20ms)
+  uint64_t totalNsec = (uint64_t)_anchorSec * 1000000000ULL + _anchorNsec;
+  totalNsec += (uint64_t)_burstPacketCount * 20000000ULL;
+
+  pkt.header.curtime.vtime_sec = (uint32_t)(totalNsec / 1000000000ULL);
+  pkt.header.curtime.vtime_nsec = (uint32_t)(totalNsec % 1000000000ULL);
+
+  // --- Rule 3: Delay Offset (Authority Alignment) ---
+  // Apply User Timing Offset (default -180ms per Authority)
+  if (_timingOffsetMs != 0) {
+    int64_t nsec = (int64_t)pkt.header.curtime.vtime_nsec;
+    nsec += (int64_t)_timingOffsetMs * 1000000LL;
+    
+    while (nsec >= 1000000000LL) {
+      nsec -= 1000000000LL;
+      pkt.header.curtime.vtime_sec++;
+    }
+    while (nsec < 0) {
+      nsec += 1000000000LL;
+      pkt.header.curtime.vtime_sec--;
+    }
+    pkt.header.curtime.vtime_nsec = (uint32_t)nsec;
+  }
+
+  // Housekeeping
+  _burstPacketCount++;
+  _lastCallTime = millis();
+  _isTransmitting = (rssi > 0);
+
+  // If burst ended (unkeyed), clear anchor for next keyup
+  if (!_isTransmitting) {
+    _anchorActive = false;
+  }
+
   // Network Byte Order for Time
   pkt.header.curtime.vtime_sec = my_htonl(pkt.header.curtime.vtime_sec);
   pkt.header.curtime.vtime_nsec = my_htonl(pkt.header.curtime.vtime_nsec);
 
   memcpy(pkt.header.challenge, _myChallenge, VOTER_CHALLENGE_LEN);
   pkt.header.digest = my_htonl(_myDigest);
-  pkt.header.payload_type = my_htons(PAYLOAD_ULAW); // Always uLaw for now
+  pkt.header.payload_type = my_htons(PAYLOAD_ULAW); 
 
-  // 2. RSSI & Audio
   pkt.rssi = rssi;
-  // pkt.audio is FRAME_SIZE (160 bytes)
   memcpy(pkt.audio, ulawData, FRAME_SIZE);
 
-  // 3. Send
   _net->sendPacket((uint8_t *)&pkt, sizeof(pkt));
 }

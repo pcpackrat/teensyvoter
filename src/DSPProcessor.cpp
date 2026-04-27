@@ -12,6 +12,7 @@ DSPProcessor::DSPProcessor() {
   _lastUpsampleVal = 0;
   _reservoirLen = 0;
   memset(_reservoir, 0, sizeof(_reservoir));
+  _rxDigitalGain = 1.0f; 
 }
 
 void DSPProcessor::begin() {
@@ -139,18 +140,19 @@ uint8_t DSPProcessor::process(int16_t *samples, bool enablePLFilter,
     arm_float_to_q15(_floatBuffer, samples, DSP_BLOCK_SAMPLES);
   }
 
-  // 4. Gain Compensation - REMOVED (causing distortion)
-  // Voter2 adds 1.5x gain after filter, but this is too much for our setup
-  // Combined with LINE IN gain + mixer gain + radio output = saturation
-  // for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
-  //   _floatBuffer[i] *= 1.5f;
-  //   // Clip
-  //   if (_floatBuffer[i] > 1.0f)
-  //     _floatBuffer[i] = 1.0f;
-  //   if (_floatBuffer[i] < -1.0f)
-  //     _floatBuffer[i] = -1.0f;
-  // }
-
+  // 4. Digital RX Gain Stage (Teensy -> Host boost)
+  if (_rxDigitalGain != 1.0f) {
+    if (!enableDeemp && !enablePLFilter) {
+       // If no other stage updated floatBuffer, do it now
+       arm_q15_to_float(samples, _floatBuffer, DSP_BLOCK_SAMPLES);
+    }
+    for (int i = 0; i < DSP_BLOCK_SAMPLES; i++) {
+      _floatBuffer[i] *= _rxDigitalGain;
+      if (_floatBuffer[i] > 1.0f) _floatBuffer[i] = 1.0f;
+      if (_floatBuffer[i] < -1.0f) _floatBuffer[i] = -1.0f;
+    }
+    arm_float_to_q15(_floatBuffer, samples, DSP_BLOCK_SAMPLES);
+  }
   return finalRSSI;
 }
 
@@ -239,7 +241,15 @@ static int16_t ulaw2linear(uint8_t u_val) {
 
 void DSPProcessor::decodeULaw(uint8_t *input, int16_t *output, int count) {
   for (int i = 0; i < count; i++) {
-    output[i] = ulaw2linear(input[i]);
+    int16_t val = ulaw2linear(input[i]);
+    
+    // Inject gentle Comfort Noise/Dither
+    if (val != 0) {
+      int comfortNoise = (rand() % 33) - 16;
+      val += comfortNoise;
+    }
+    
+    output[i] = val;
   }
 }
 
@@ -258,86 +268,86 @@ void DSPProcessor::upsampleAndPlay(int16_t *input, int count,
   if (totalLen > 200)
     totalLen = 200; // Protection
 
-  // Construct combined buffer
+  // Construct combined buffer (We need a history of 1 sample before the current index, 
+  // and 2 samples after, for 4-point Hermite interpolation)
   if (_reservoirLen > 0) {
     memcpy(workBuf, _reservoir, _reservoirLen * sizeof(int16_t));
   }
   memcpy(workBuf + _reservoirLen, input, count * sizeof(int16_t));
+  
+  // SANITY CHECK: If the entire buffer is digital silence (0 in PCM), 
+  // ensure we don't carry over any phase noise.
+  bool allSilence = true;
+  for(int i=0; i<_reservoirLen; i++) if(_reservoir[i] != 0) { allSilence = false; break; }
+  if(allSilence) {
+    for(int i=0; i<count; i++) if(input[i] != 0) { allSilence = false; break; }
+  }
 
-  // 2. Processing Loop
-  const float step = 8000.0f / 44100.0f;
+  if (allSilence) {
+    _upsamplePhase = 1.0; // Start at 1.0 to ensure idx-1 is safe for Hermite
+  }
+
+  // 2. Processing Loop (8kHz -> 44.1kHz)
   const int BLOCK_SIZE = 128;
 
-  // We loop as long as we have enough input to fill a FULL output block.
-  // We need (128 - 1) * step input samples relative to current phase?
-  // Basically, if phase points to index X, we need input up to X + (127*step).
-  // Safest: Check if the LAST sample we would access is within bounds.
-  // last_idx = floor(_upsamplePhase + 127*step).
-  // If last_idx < totalLen, we are good.
-
   while (true) {
-    // Check if we can satisfy a full block
-    float endPhase = _upsamplePhase + (float)(BLOCK_SIZE - 1) * step;
-    int endIdx = (int)ceil(endPhase); // Need sample at ceil if interpolating?
-                                      // Actually linear interp uses floor and
-                                      // floor+1. So we need floor(endPhase)+1.
+    // Check if we can satisfy a full block (128 output samples)
+    const double step = 8000.0 / 44100.0;
+    double endPhase = _upsamplePhase + (double)(BLOCK_SIZE - 1) * step;
+    int endIdx = (int)ceil(endPhase);
 
-    if (endIdx + 1 >= totalLen) {
-      // Not enough input for a full block. Stop.
-      break;
-    }
+    // Ensure we don't overrun
+    if (endIdx >= totalLen - 1) break;
 
     // Get Output Buffer
     int16_t *out = queue.getBuffer();
     if (out == NULL) {
-      // Queue full. We must drop to maintain real-time.
-      // But we can't just return, we need to advance phase to consume the input
-      // time.
-      // Advance phase by 128 output samples worth of time.
-      _upsamplePhase += (float)BLOCK_SIZE * step;
-      continue; // Check loop condition again (might run out of input now)
+      _upsamplePhase += (double)BLOCK_SIZE * step;
+      continue;
     }
 
-    // Generate Block
+    // CATMULL-ROM CUBIC SPLINE UPSAMPLING (Polyphase Resampler)
+    // Completely eliminates "staircase" Nytendo fuzziness associated with ZOH/Linear.
     for (int i = 0; i < BLOCK_SIZE; i++) {
       int idx = (int)_upsamplePhase;
-      float frac = _upsamplePhase - idx;
+      float mu = _upsamplePhase - (double)idx;
 
-      int16_t s1 = workBuf[idx];     // Safe by check above
-      int16_t s2 = workBuf[idx + 1]; // Safe by check above
+      float p0 = (idx >= 1) ? workBuf[idx - 1] : workBuf[0];
+      float p1 = workBuf[idx];
+      float p2 = workBuf[idx + 1];
+      float p3 = (idx + 2 < totalLen) ? workBuf[idx + 2] : workBuf[totalLen - 1];
 
-      // Linear Interpolation
-      out[i] = s1 + (int16_t)(frac * (s2 - s1));
+      // Cubic coefficients
+      float mu2 = mu * mu;
+      float a0 = -0.5f*p0 + 1.5f*p1 - 1.5f*p2 + 0.5f*p3;
+      float a1 = p0 - 2.5f*p1 + 2.0f*p2 - 0.5f*p3;
+      float a2 = -0.5f*p0 + 0.5f*p2;
+      float a3 = p1;
 
+      float v = a0*mu*mu2 + a1*mu2 + a2*mu + a3;
+      
+      // Hard limiter
+      if (v > 32767.0f) v = 32767.0f;
+      if (v < -32768.0f) v = -32768.0f;
+      
+      out[i] = (int16_t)v;
       _upsamplePhase += step;
     }
 
     queue.playBuffer();
+    // Check for next block loop condition is handled at the start of while
   }
 
   // 3. Save Residue
-  // Current _upsamplePhase is relative to workBuf start.
-  // We want to discard used samples and keep the rest.
   int consumed = (int)_upsamplePhase;
   int remaining = totalLen - consumed;
 
-  if (remaining > 32) {
-    // Logic Error or massive gap?
-    // Just keep last 32?
-    // Shift consumed up.
-    consumed = totalLen - 32;
-    remaining = 32;
-    _upsamplePhase -= (float)consumed; // Adjust phase to new base
-  } else if (remaining < 0) {
-    remaining = 0;
-    _upsamplePhase = 0.0f;
-  } else {
-    _upsamplePhase -= (float)consumed;
-  }
-
-  // Save to reservoir
-  if (remaining > 0) {
+  if (remaining > 0 && remaining < 100) {
     memcpy(_reservoir, workBuf + consumed, remaining * sizeof(int16_t));
+    _reservoirLen = remaining;
+    _upsamplePhase -= (double)consumed;
+  } else {
+    _reservoirLen = 0;
+    _upsamplePhase = 0.0;
   }
-  _reservoirLen = remaining;
 }

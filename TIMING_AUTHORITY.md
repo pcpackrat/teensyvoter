@@ -44,4 +44,6 @@ Based on Voter2 developer feedback:
 
 *   **Timestamps**:
     *   **Seconds**: Standard Unix time.
-    *   **Nanoseconds**: This field increments by **1** for every packet sent. It acts as a secondary sequence number rather than a precise sub-second timestamp.
+    *   **Nanoseconds**: 
+        *   **General Purpose Packets (GPS/Auth)**: Increments by **1** for every packet sent (sequence counter).
+        *   **Audio Payload Packets**: Acts as a high-resolution sub-second timestamp, incrementing by exactly **20,000,000** per 20ms packet to satisfy the server's jitter buffer requirements.

@@ -44,6 +44,8 @@ public:
   bool isConnected() { return _state == VOTER_CONNECTED; }
   VoterState getState() { return _state; }
   VoterAuthError getAuthError() { return _authError; }
+  void setTimingOffset(int16_t ms) { _timingOffsetMs = ms; }
+  uint32_t getLastHostAudioTime() { return _lastHostAudioTime; }
 
 private:
   // Core Dependencies
@@ -80,6 +82,28 @@ private:
   uint32_t _lastRxTime;
   bool _hasWarnedAuth;
   bool _hasWarnedGps;
+
+  // Protocol Sequencing
+  uint32_t _packetCounter; // Free-running 20ms counter
+  int32_t _seqOffset;      // Phase offset to align sequence with PPS
+
+  // Transmission State and Delay Buffer
+  bool _isTransmitting;         // True if we are currently sending audio
+  int16_t _timingOffsetMs;      // User-defined offset (+ = newer, - = older)
+  uint32_t _lastCallTime;       // Last audio frame processing time
+
+  // Authority Alignment: Continuous Frame Counting
+  uint32_t _anchorSec;
+  uint32_t _anchorNsec;
+  uint32_t _burstPacketCount;
+  bool _anchorActive;
+  uint32_t _gpSeq;              // GP Sequence (+1 per non-audio packet)
+  uint32_t _lastHostAudioTime; // Timestamp of last audio packet from server
+
+public:
+  uint32_t getPacketCounter() { return _packetCounter; }
+  void incrementPacketCounter() { _packetCounter++; }
+  void alignTimestampPhase(); // Called on PPS to align sequence logic
 };
 
 #endif

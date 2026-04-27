@@ -2,16 +2,9 @@
 #define ESP_SPI_DRIVER_H
 
 #include "NetworkDriver.h"
+#include "SpiProtocol.h"
 #include <Arduino.h>
 #include <SPI.h>
-
-// Simple Protocol Constants
-// Protocol Constants (Must match Spirit.ino)
-#define CMD_SEND_UDP 0x10
-#define CMD_SET_CONFIG 0x02
-#define CMD_GET_IP 0x03
-#define CMD_DNS_LOOKUP 0x04
-#define CMD_GET_DNS 0x05
 
 class EspSpiDriver : public NetworkDriver {
 public:
@@ -37,6 +30,11 @@ public:
   IPAddress resolveHostname(const char *hostname);
   IPAddress getDNSServer();
 
+  // Config Management (for ESP32 web server)
+  void pushConfig(const void *configData, uint16_t configLen);
+  bool hasConfigCmd();
+  int readConfigCmd(uint8_t *buffer, size_t maxLen);
+
 private:
   uint8_t _cs, _ready, _reset;
   IPAddress _targetIP;
@@ -46,6 +44,10 @@ private:
   // Buffers
   uint8_t _rxBuffer[512];
   int _rxLen;
+
+  // Config command buffer (from ESP32 web server)
+  uint8_t _cfgBuffer[256];
+  int _cfgLen;
 
   // SPI Helpers
   void _spiTransfer(uint8_t *data, size_t len);
