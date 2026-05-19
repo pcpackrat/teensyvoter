@@ -151,7 +151,7 @@ void VoterClient::update() {
         char ts[20];
         _gps->getTimestamp(ts);
         Serial.printf(
-            "%s [Voter] GPS Signal Lost! Entering 60s holdover mode...\r\n",
+            "%s [Voter] GPS Signal Lost! Entering 1s holdover mode...\r\n",
             ts);
       }
 
