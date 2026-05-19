@@ -25,8 +25,9 @@
 #include "NetworkManager.h"
 #include "VoterClient.h"
 #include "VoterProtocol.h"
-#include "WebServer.h"
+#include "TeensyWebServer.h"
 #include "Version.h"
+#include "Logger.h"
 
 #define RSSI_PIN 38 // A14 - Connect to voltage divider output (0-3.3V)
 #define COS_PIN 41  // Hardware COS input (active HIGH/LOW depending on radio)
@@ -127,8 +128,19 @@ DSPProcessor dsp;
 WebServer webServer;
 // WebInterface web;
 ConfigManager cfg;
+bool networkReady = false; // Global: set in setup(), used in loop()
 
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
+
+// --- Forward Declarations ---
+void handleSerialCLI();
+void printMenu();
+
+// --- Yield Callback for blocking network operations ---
+void voterYield() {
+  gps.update();
+  handleSerialCLI();
+}
 
 // -----------------------------------------------------------------------------
 // Helper: Reset Audio State
@@ -145,6 +157,11 @@ void setup() {
   // 1. Serial & Boot Config
   Serial.begin(9600);
   delay(100);
+
+  // Increase GPS Serial Buffer to handle stalls during DNS resolution
+  static uint8_t gpsReadBuffer[2048];
+  GPS_SERIAL.addMemoryForRead(gpsReadBuffer, sizeof(gpsReadBuffer));
+  GPS_SERIAL.begin(9600);
 
   Serial.println("========================================");
   Serial.print("TeensyVoter Firmware v");
@@ -269,7 +286,7 @@ void setup() {
   // 3. Network - Auto-select: Try Ethernet first, fallback to WiFi
   Serial.println("[System] Initializing Network Driver...");
 
-  bool networkReady = false;
+  networkReady = false;
 
   // Try Ethernet first
   Serial.println("[Network] Attempting Ethernet (NativeEthernet)...");
@@ -290,8 +307,10 @@ void setup() {
   if (ethSuccess) {
     Serial.println("[Network] ✓ Ethernet Connected!");
     netMgr.begin(&ethDriver, mac);
+    netMgr.setYieldCallback(voterYield);
     networkReady = true;
-  } else {
+  }
+ else {
     Serial.println(
         "[Network] ✗ Ethernet unavailable (no cable or DHCP failure)");
 
@@ -302,7 +321,11 @@ void setup() {
     if (spiDriver.begin(mac)) {
       // Give ESP32 time to boot AFTER the hardware reset
       Serial.println("[System] Waiting for ESP32 Boot (5s)...");
-      delay(5000);
+      uint32_t bootStart = millis();
+      while (millis() - bootStart < 5000) {
+        handleSerialCLI();
+        delay(10);
+      }
 
       // Send WiFi Credentials (retry 3x to guarantee delivery across SPI slave arming gaps)
       for (int attempt = 1; attempt <= 3; attempt++) {
@@ -311,17 +334,22 @@ void setup() {
         delay(200); // Allow ESP32 to process before next attempt
       }
 
+      spiDriver.setStaticDNS(IPAddress(cfg.data.dnsServerIP));
       netMgr.begin(&spiDriver, mac);
+      netMgr.setYieldCallback(voterYield);
 
-      // Wait for IP (up to 15s) with Audio Maintenance
+      // Wait for IP (up to 45s) with Audio Maintenance & CLI access
       Serial.print("[System] Waiting for WiFi Connection");
       bool ipFound = false;
-      for (int i = 0; i < 30; i++) { // 30 * 500ms = 15 seconds
+      for (int i = 0; i < 90; i++) { // 90 * 500ms = 45 seconds
         // Maintain Audio Queue (Prevent Overflow/Crash)
         while (recordQueue.available() > 0) {
           recordQueue.readBuffer();
           recordQueue.freeBuffer();
         }
+
+        // Keep Serial CLI responsive during connection
+        handleSerialCLI();
 
         // Check IP
         IPAddress myIP = netMgr.getLocalIP();
@@ -354,63 +382,69 @@ void setup() {
   }
 
   if (!networkReady) {
-    Serial.println("[Network] ERROR: No network available! Check Ethernet "
-                   "cable or WiFi settings.");
+    Serial.println("[Network] ERROR: No network available! Will retry in background.");
+  } else {
+    Serial.println("[Network] Status: ONLINE");
   }
 
-  delay(100);
+  delay(500); // Stabilization delay
 
-  // 4.1 Config (Moved to top)
-  // cfg.begin();
+  // --- Only proceed with network-dependent init if we have a connection ---
+  if (networkReady) {
+    // Resolve hostname if set
+    if (cfg.data.hostname[0] != '\0') {
+      Serial.print("[DNS] Hostname configured: ");
+      Serial.println(cfg.data.hostname);
+      Serial.println("[DNS] Resolving...");
 
-  // Now we have config, resolve hostname if set
-  if (cfg.data.hostname[0] != '\0') {
-    Serial.print("[DNS] Hostname configured: ");
-    Serial.println(cfg.data.hostname);
-    Serial.println("[DNS] Resolving...");
+      IPAddress resolvedIP;
+      if (netMgr.getType() == DRIVER_WIFI_SPI) {
+        resolvedIP = spiDriver.resolveHostname(cfg.data.hostname);
+      } else if (netMgr.getType() == DRIVER_ETHERNET) {
+        resolvedIP = ethDriver.resolveHostname(cfg.data.hostname);
+      }
 
-    IPAddress resolvedIP;
-    if (netMgr.getType() == DRIVER_WIFI_SPI) {
-      resolvedIP = spiDriver.resolveHostname(cfg.data.hostname);
-    } else if (netMgr.getType() == DRIVER_ETHERNET) {
-      resolvedIP = ethDriver.resolveHostname(cfg.data.hostname);
+      if (resolvedIP != IPAddress(0, 0, 0, 0)) {
+        cfg.setHostIP(resolvedIP);
+        Serial.print("[DNS] Using resolved IP: ");
+        Serial.println(resolvedIP);
+      } else {
+        Serial.println("[DNS] Resolution failed, using stored IP");
+      }
     }
 
-    if (resolvedIP != IPAddress(0, 0, 0, 0)) {
-      cfg.setHostIP(resolvedIP);
-      Serial.print("[DNS] Using resolved IP: ");
-      Serial.println(resolvedIP);
-    } else {
-      Serial.println("[DNS] Resolution failed, using stored IP");
+    // Resolve Syslog Hostname if set
+    if (cfg.data.useSyslog && cfg.data.syslogHostname[0] != '\0') {
+      Serial.printf("[DNS] Resolving Syslog Host: %s\r\n", cfg.data.syslogHostname);
+      IPAddress resolved = netMgr.resolveHostname(cfg.data.syslogHostname);
+      if (resolved != IPAddress(0, 0, 0, 0)) {
+        cfg.data.syslogIP = (uint32_t)resolved;
+        Serial.printf("[DNS] Syslog IP: %u.%u.%u.%u\r\n", resolved[0],
+                      resolved[1], resolved[2], resolved[3]);
+      }
     }
+
+    netMgr.setTarget(cfg.getHostIP(), cfg.data.hostPort);
+
+    Serial.print("[System] Voter Target: ");
+    Serial.print(cfg.getHostIP());
+    Serial.printf(":%u\r\n", cfg.data.hostPort);
   }
 
-  netMgr.setTarget(cfg.getHostIP(), cfg.data.hostPort);
-
-  Serial.print("[System] Voter Target: ");
-  Serial.print(cfg.getHostIP());
-  Serial.printf(":%u\r\n", cfg.data.hostPort);
-
-  // 5. Voter Client
-
-  // 5. Voter Client
-  // Serial.println("[Voter] Initializing Protocol Client...");
-  voterClient.begin(&netMgr, &gps, cfg.getHostIP(), cfg.data.hostPort,
-                    cfg.data.clientPwd, cfg.data.hostPwd);
+  // 5. Voter Client (only start if network available)
+  if (networkReady) {
+    voterClient.begin(&netMgr, &gps, cfg.getHostIP(), cfg.data.hostPort,
+                      cfg.data.clientPwd, cfg.data.hostPwd);
+  }
 
   // 6. DSP
   dsp.begin();
 
   // Initialize Decimator
-  // Coeffs: Simple averaging for now (1/48).
-  // TODO: Replace with proper Low-Pass Sinc coefficients for better
-  // anti-aliasing
   for (int i = 0; i < DECIMATOR_NUM_TAPS; i++) {
     decimatorCoeffs[i] = 1.0f / (float)DECIMATOR_NUM_TAPS;
   }
 
-  // Use a safe input block size (multiple of M=6) for Init check. 120 is
-  // safe.
   arm_status status = arm_fir_decimate_init_f32(
       &decimator, DECIMATOR_NUM_TAPS, DECIMATION_FACTOR, decimatorCoeffs,
       decimatorState, 120);
@@ -424,6 +458,12 @@ void setup() {
   webServer.setConfig(&cfg);
   webServer.setSystemObjects(&netMgr, &voterClient, &gps);
   webServer.begin();
+
+  // 8. Logger (only start if network available)
+  if (networkReady) {
+    logger.begin(&netMgr, &cfg);
+    logger.info("SYS", "TeensyVoter v%s Boot Complete", FIRMWARE_VERSION);
+  }
 }
 
 // Helper for proper input echo
@@ -494,6 +534,13 @@ void exportSettings() {
   Serial.printf("dspCalib=%.1f\r\n", cfg.data.dspCalib);
   Serial.printf("enablePLFilter=%d\r\n", cfg.data.enablePLFilter ? 1 : 0);
   Serial.printf("enableDeemp=%d\r\n", cfg.data.enableDeemp ? 1 : 0);
+  
+  // Syslog
+  Serial.printf("useSyslog=%d\r\n", cfg.data.useSyslog ? 1 : 0);
+  IPAddress sip(cfg.data.syslogIP);
+  Serial.printf("syslogIP=%u.%u.%u.%u\r\n", sip[0], sip[1], sip[2], sip[3]);
+  Serial.printf("syslogHostname=%s\r\n", cfg.data.syslogHostname);
+  Serial.printf("syslogPort=%u\r\n", cfg.data.syslogPort);
 
   Serial.println("#");
   Serial.println("# End of export");
@@ -560,6 +607,16 @@ bool parseConfigLine(String line) {
     cfg.data.enablePLFilter = (value.toInt() != 0);
   } else if (key == "enableDeemp") {
     cfg.data.enableDeemp = (value.toInt() != 0);
+  } else if (key == "useSyslog") {
+    cfg.data.useSyslog = (value.toInt() != 0);
+  } else if (key == "syslogIP") {
+    IPAddress ip;
+    if (ip.fromString(value)) cfg.data.syslogIP = (uint32_t)ip;
+  } else if (key == "syslogHostname") {
+    strncpy(cfg.data.syslogHostname, value.c_str(), 63);
+    cfg.data.syslogHostname[63] = '\0';
+  } else if (key == "syslogPort") {
+    cfg.data.syslogPort = value.toInt();
   } else {
     return false; // Unknown key
   }
@@ -738,7 +795,24 @@ void printMenu() {
       Serial.printf(" [1] WiFi SSID   : %s\r\n", cfg.data.wifiSSID);
       Serial.println(" [2] Set WiFi Password");
       Serial.println(" [R] Resend WiFi Credentials to ESP32");
+      
+      IPAddress wdns(cfg.data.dnsServerIP);
+      if (wdns != IPAddress(0, 0, 0, 0)) {
+        Serial.printf(" [3] WiFi DNS    : %u.%u.%u.%u\r\n", wdns[0], wdns[1], wdns[2], wdns[3]);
+      } else {
+        Serial.println(" [3] WiFi DNS    : (DHCP Default)");
+      }
     }
+
+    Serial.println(" -- Syslog Settings --");
+    Serial.printf(" [6] Use Syslog   : %s\r\n", cfg.data.useSyslog ? "YES" : "NO");
+    if (cfg.data.syslogHostname[0] != '\0') {
+        Serial.printf(" [7] Syslog Host  : %s\r\n", cfg.data.syslogHostname);
+    } else {
+        IPAddress sip(cfg.data.syslogIP);
+        Serial.printf(" [7] Syslog IP    : %u.%u.%u.%u\r\n", sip[0], sip[1], sip[2], sip[3]);
+    }
+    Serial.printf(" [8] Syslog Port  : %u\r\n", cfg.data.syslogPort);
 
     Serial.println("----------------------------------------");
     Serial.println(" [S] Save & Reboot");
@@ -1005,6 +1079,40 @@ void handleSerialCLI() {
         Serial.println("Resending Credentials...");
         spiDriver.setCredentials(cfg.data.wifiSSID, cfg.data.wifiPass);
         break;
+      case '6':
+        cfg.data.useSyslog = !cfg.data.useSyslog;
+        printMenu();
+        break;
+      case '7': {
+        Serial.print("\r\nEnter Syslog Server IP or Hostname: ");
+        String val = readStringEcho();
+        val.trim();
+        IPAddress ip;
+        if (ip.fromString(val)) {
+          cfg.data.syslogIP = (uint32_t)ip;
+          memset(cfg.data.syslogHostname, 0, sizeof(cfg.data.syslogHostname));
+        } else if (val.length() > 0 && val.length() < 64) {
+          strncpy(cfg.data.syslogHostname, val.c_str(), 63);
+          cfg.data.syslogHostname[63] = '\0';
+          cfg.data.syslogIP = 0;
+          
+          // Resolve immediately
+          Serial.println("\r\n[DNS] Resolving...");
+          IPAddress resolved = netMgr.resolveHostname(cfg.data.syslogHostname);
+          if (resolved != IPAddress(0,0,0,0)) {
+              cfg.data.syslogIP = (uint32_t)resolved;
+              Serial.printf("[DNS] Resolved to: %u.%u.%u.%u\r\n", resolved[0], resolved[1], resolved[2], resolved[3]);
+          }
+        }
+        printMenu();
+        break;
+      }
+      case '8': {
+        Serial.print("\r\nEnter Syslog Port: ");
+        cfg.data.syslogPort = readStringEcho().toInt();
+        printMenu();
+        break;
+      }
       case 's':
       case 'S':
         cfg.save();
@@ -1378,7 +1486,7 @@ void handleSerialCLI() {
             if (c == '=') {
               cfg.data.radioRxDigitalGainPct += 10;
               if (cfg.data.radioRxDigitalGainPct > 500)
-                cfg.data.radioRxDigitalGainPct = 500;
+                cfg.data.radioRxDigitalGainPct = 255;
               float gainFactor = (float)cfg.data.radioRxDigitalGainPct / 100.0f;
               mixerRX.gain(0, gainFactor);
               mixerRX.gain(1, gainFactor);
@@ -1435,6 +1543,7 @@ void loop() {
 
   // 1. Core Updates
   handleSerialCLI();
+  logger.update();
 
   gps.update();
   if (gps.checkPPS()) {
@@ -1533,6 +1642,21 @@ void loop() {
           case PARAM_INPUT_SOURCE:
             if (valLen == 1) cfg.data.inputSource = val[0];
             break;
+          case PARAM_USE_SYSLOG:
+            if (valLen == 1) cfg.data.useSyslog = val[0];
+            break;
+          case PARAM_SYSLOG_IP:
+            if (valLen == 4) memcpy(&cfg.data.syslogIP, val, 4);
+            break;
+          case PARAM_SYSLOG_HOSTNAME:
+            if (valLen < sizeof(cfg.data.syslogHostname)) {
+                memset(cfg.data.syslogHostname, 0, sizeof(cfg.data.syslogHostname));
+                memcpy(cfg.data.syslogHostname, val, valLen);
+            }
+            break;
+          case PARAM_SYSLOG_PORT:
+            if (valLen == 2) cfg.data.syslogPort = (val[0] << 8) | val[1];
+            break;
         }
         Serial.printf("[WebCfg] SET_PARAM id=0x%02X len=%d\r\n", paramId, valLen);
       } else if (subCmd == CFG_CMD_SAVE_REBOOT) {
@@ -1552,7 +1676,27 @@ void loop() {
     }
   }
 
-  voterClient.update();
+  // Periodic Network Recovery if offline
+  static uint32_t lastNetCheck = 0;
+  if (!networkReady && (millis() - lastNetCheck > 5000)) {
+    lastNetCheck = millis();
+    IPAddress myIP = netMgr.getLocalIP();
+    if (myIP != IPAddress(0, 0, 0, 0)) {
+        Serial.printf("\r\n[Network] Late Connection Detected! IP: %u.%u.%u.%u\r\n", 
+                      myIP[0], myIP[1], myIP[2], myIP[3]);
+        networkReady = true;
+        
+        // Late Init Components
+        voterClient.begin(&netMgr, &gps, cfg.getHostIP(), cfg.data.hostPort,
+                          cfg.data.clientPwd, cfg.data.hostPwd);
+        logger.begin(&netMgr, &cfg);
+        logger.info("SYS", "TeensyVoter v%s Late Boot Complete", FIRMWARE_VERSION);
+    }
+  }
+
+  if (networkReady) {
+    voterClient.update();
+  }
   webServer.handleClient(); // Handle web requests
 
   // Debug Jitter Buffer
@@ -1699,9 +1843,9 @@ void loop() {
         if (rawRSSI > cfg.data.rssiMax)
           rawRSSI = cfg.data.rssiMax;
 
-        // Map to 0-255 (Simple linear map)
+        // Map to 0-127 (7-bit RSSI per protocol spec)
         // Note: map() uses integer math.
-        long mapped = map(rawRSSI, cfg.data.rssiMin, cfg.data.rssiMax, 0, 255);
+        long mapped = map(rawRSSI, cfg.data.rssiMin, cfg.data.rssiMax, 0, 127);
         baseRSSI = (uint8_t)mapped;
       } else {
         // DSP RSSI Mode
@@ -1736,13 +1880,16 @@ void loop() {
           finalRSSI = 0; // Squelch Closed (Inactive)
         } else {
           // Squelch Open (Active)
-          // Pass the Software RSSI (baseRSSI) through.
-          // User Request: "hardware cos and software rssi"
+          // Set bit 7 (COR) and use baseRSSI (0-127) for bits 0-6
+          finalRSSI = (baseRSSI & 0x7F) | 0x80;
         }
         break;
       case COS_MODE_DSP:
-        if (dsp.getNoiseLevel() >= cfg.data.dspSquelchThresh)
+        if (dsp.getNoiseLevel() >= cfg.data.dspSquelchThresh) {
           finalRSSI = 0;
+        } else {
+          finalRSSI = (baseRSSI & 0x7F) | 0x80;
+        }
         break;
       }
 
@@ -1779,10 +1926,17 @@ void loop() {
           tailCount--;
         }
 
-        // Hardcode standard -180ms delay offset 
-        // This physically perfectly aligns the timestamps with the Reference Voter hardware
-        // Without this bias, Teensy timestamps sit bleeding edge 'in the future' and get dropped!
-        voterClient.setTimingOffset(-180);
+        // Standard -120ms delay offset for modern Ethernet (was -180ms)
+        voterClient.setTimingOffset(-120);
+        
+        // Periodic Status Heartbeat (every 5 seconds)
+        static uint32_t lastHb = 0;
+        if (millis() - lastHb > 5000) {
+            lastHb = millis();
+            Serial.printf("[Heartbeat] GPS: %s, Sats: %u, Epoch: %lu\r\n", 
+                          gps.isLocked() ? "LOCKED" : "WAITING", 
+                          gps.getSatellites(), gps.getEpoch());
+        }
         
         VTIME frameTime = {0, 0};
         if (gps.isTimeSet()) {
@@ -1794,8 +1948,18 @@ void loop() {
           finalRSSI = (uint8_t)g_forcedRSSI;
         }
 
+        static bool lastAudioState = false;
+        if (!lastAudioState) {
+            Serial.println("[Voter] First audio frame dispatched to driver.");
+            lastAudioState = true;
+        }
         voterClient.processAudioFrame(ulawFrame, finalRSSI, frameTime);
       } else {
+        static bool lastAudioState = true;
+        if (lastAudioState) {
+            // Only clear when we stop sending
+            lastAudioState = false;
+        }
         // Completely Idle - Do nothing.
       }
 

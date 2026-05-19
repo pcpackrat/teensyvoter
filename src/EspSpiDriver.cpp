@@ -8,6 +8,7 @@ EspSpiDriver::EspSpiDriver(uint8_t csPin, uint8_t readyPin, uint8_t resetPin) {
   _rxLen = 0;
   _cfgLen = 0;
   _cachedIP = IPAddress(0, 0, 0, 0);
+  _staticDNS = IPAddress(0, 0, 0, 0);
 }
 
 bool EspSpiDriver::begin(uint8_t *mac) {
@@ -22,254 +23,209 @@ bool EspSpiDriver::begin(uint8_t *mac) {
   pinMode(_ready, INPUT);
 
   SPI.begin();
-  // Default to generic SPI speed
   return true;
 }
 
 void EspSpiDriver::update() {
-  // Check READY pin from ESP if we aren't using interrupts
-  // If HIGH, it means ESP has data for us.
-  if (digitalRead(_ready) == HIGH) {
-    // Prepare to read?
-    // For simplicity, we just let parsePacket handle it when called.
-    // Or we could buffer here.
-  }
+  // Stub - parsePacket handles reads.
 }
 
 void EspSpiDriver::sendPacket(const uint8_t *data, uint16_t len) {
-  // Format: [CMD] [LEN_HI] [LEN_LO] [IP...4] [PORT...2] [DATA...]
+  sendPacketTo(_targetIP, _targetPort, data, len);
+}
 
-  // SPI Collision Evasion Maneuver: 
-  // If the ESP32 is already asserting READY, a UDP packet is sitting identically in the DMA buffer.
-  // If we initiate a TX command right now, the DMA will physically blast the UDP packet at us while we
-  // clock out the TX command! To prevent silent packet loss, we explicitly read it first into _rxBuffer!
+void EspSpiDriver::sendPacketTo(IPAddress ip, uint16_t port, const uint8_t *data, uint16_t len) {
+  static bool isSending = false;
+  if (isSending) return; // Prevent recursive calls during SPI transactions
+  isSending = true;
+
+  // Collision evasion: Read pending data if READY is HIGH
   if (digitalRead(_ready) == HIGH) {
-      parsePacket();
+    parsePacket();
   }
+  // Give the ESP32 more time to re-arm its SPI slave driver between transactions
+  delayMicroseconds(2000); 
 
-  SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  // 4MHz is the maximum stable speed for long-wire SPI slave on ESP32
+  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
+  delayMicroseconds(100); // More time for the ESP32 to detect the CS edge
 
-  // Header
-  uint8_t header[9];
-  header[0] = CMD_SEND_UDP;
-  header[1] = (len >> 8) & 0xFF;
-  header[2] = (len & 0xFF);
-  header[3] = _targetIP[0];
-  header[4] = _targetIP[1];
-  header[5] = _targetIP[2];
-  header[6] = _targetIP[3];
-  header[7] = (_targetPort >> 8) & 0xFF;
-  header[8] = (_targetPort & 0xFF);
+  // Buffer for the entire 512-byte transaction to use efficient block transfer
+  uint8_t buffer[MAX_SPI_BUF];
+  memset(buffer, 0, MAX_SPI_BUF);
 
-  SPI.transfer(header, 9);
+  // Header: [CMD] [LEN_HI] [LEN_LO] [IP...4] [PORT...2]
+  buffer[0] = CMD_SEND_UDP;
+  buffer[1] = (len >> 8) & 0xFF;
+  buffer[2] = len & 0xFF;
+  for (int i = 0; i < 4; i++) buffer[3 + i] = ip[i];
+  buffer[7] = (port >> 8) & 0xFF;
+  buffer[8] = port & 0xFF;
 
-  // Data
-  for (uint16_t i = 0; i < len; i++) {
-    SPI.transfer(data[i]);
-  }
+  // Payload
+  uint16_t payloadLen = (len > (MAX_SPI_BUF - 9)) ? (MAX_SPI_BUF - 9) : len;
+  memcpy(&buffer[9], data, payloadLen);
 
-  // Padding bytes to ensure FIFO flushes and last byte is latched (Fix for
-  // dropped bytes)
-  for (int k = 0; k < 4; k++) {
-    SPI.transfer(0x00);
-    delayMicroseconds(5);
-  }
-
-  // Wait before CS HIGH
-  delayMicroseconds(50);
+  // Efficient block transfer
+  SPI.transfer(buffer, MAX_SPI_BUF);
 
   digitalWrite(_cs, HIGH);
   SPI.endTransaction();
+  isSending = false; // Reset reentrancy guard
 }
 
 void EspSpiDriver::setCredentials(const char *ssid, const char *pass) {
   uint8_t ssidLen = strlen(ssid);
   uint8_t passLen = strlen(pass);
 
-  SPI.beginTransaction(
-      SPISettings(1000000, MSBFIRST, SPI_MODE0)); // Slow for config
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
+  delayMicroseconds(50);
 
   SPI.transfer(CMD_SET_CONFIG);
   SPI.transfer(ssidLen);
-  for (int i = 0; i < ssidLen; i++)
-    SPI.transfer(ssid[i]);
-
+  for (int i = 0; i < ssidLen; i++) SPI.transfer(ssid[i]);
+  
   SPI.transfer(passLen);
-  for (int i = 0; i < passLen; i++) {
-    SPI.transfer(pass[i]);
-    delayMicroseconds(5);
-  }
+  for (int i = 0; i < passLen; i++) SPI.transfer(pass[i]);
 
-  // Padding bytes to ensure FIFO flushes and last byte is latched
-  for (int k = 0; k < 4; k++) {
+  // Pad to 512
+  int sent = 3 + ssidLen + passLen;
+  while (sent < MAX_SPI_BUF) {
     SPI.transfer(0x00);
-    delayMicroseconds(5);
+    sent++;
   }
-
-  // Wait before CS HIGH to ensure physical transmission matches FIFO
-  delayMicroseconds(50);
 
   digitalWrite(_cs, HIGH);
   SPI.endTransaction();
 }
 
 IPAddress EspSpiDriver::resolveHostname(const char *hostname) {
-  if (!hostname || hostname[0] == '\0') {
-    return IPAddress(0, 0, 0, 0); // Invalid hostname
-  }
+  if (!hostname || hostname[0] == '\0') return IPAddress(0, 0, 0, 0);
+  uint8_t hLen = strlen(hostname);
 
-  uint8_t hostnameLen = strlen(hostname);
-  if (hostnameLen > 63) {
-    Serial.println("[DNS] Hostname too long");
-    return IPAddress(0, 0, 0, 0);
+  // Aggressively clear any pending data
+  for (int i = 0; i < 3; i++) {
+    if (digitalRead(_ready) == HIGH) {
+      parsePacket();
+      delay(50);
+    }
   }
-
-  Serial.printf("[DNS] Resolving: %s\n", hostname);
+  
+  delay(200); // Settle time
 
   SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
-
-  // Send DNS lookup command
-  SPI.transfer(CMD_DNS_LOOKUP);
-  SPI.transfer(hostnameLen);
-  for (int i = 0; i < hostnameLen; i++) {
-    SPI.transfer(hostname[i]);
-  }
-
-  // Padding to flush FIFO
-  for (int k = 0; k < 4; k++) {
-    SPI.transfer(0x00);
-    delayMicroseconds(5);
-  }
-
   delayMicroseconds(50);
+
+  SPI.transfer(CMD_DNS_LOOKUP);
+  SPI.transfer(hLen);
+  for (int i = 0; i < hLen; i++) SPI.transfer(hostname[i]);
+
+  // Pad to 512
+  for (int i = hLen + 2; i < MAX_SPI_BUF; i++) SPI.transfer(0x00);
+
   digitalWrite(_cs, HIGH);
   SPI.endTransaction();
 
-  // Wait for ESP32 to perform DNS lookup (can take 1-5 seconds)
-  Serial.println("[DNS] Waiting for response...");
-  uint32_t startTime = millis();
-  while (millis() - startTime < 10000) { // 10 second timeout
+  // Wait for resolution (up to 10s)
+  uint32_t start = millis();
+  while (millis() - start < 10000) {
     if (digitalRead(_ready) == HIGH) {
       delayMicroseconds(500);
-
       SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
       digitalWrite(_cs, LOW);
+      delayMicroseconds(50);
 
       uint8_t status = SPI.transfer(0x00);
-      if (status & STATUS_HAS_DATA) {
-        uint8_t lenHi = SPI.transfer(0x00);
-        uint8_t lenLo = SPI.transfer(0x00);
-        uint16_t len = (lenHi << 8) | lenLo;
+      uint8_t lenHi  = SPI.transfer(0x00);
+      uint8_t lenLo  = SPI.transfer(0x00);
+      uint16_t len   = (lenHi << 8) | lenLo;
 
-        if (len == 4) { // IP address is 4 bytes
-          uint8_t ip[4];
-          for (int i = 0; i < 4; i++) {
-            ip[i] = SPI.transfer(0x00);
-          }
+      uint8_t ip[4] = {0, 0, 0, 0};
+      if ((status & STATUS_HAS_DATA) && len == 4) {
+        for (int i = 0; i < 4; i++) ip[i] = SPI.transfer(0x00);
+      }
 
-          digitalWrite(_cs, HIGH);
-          SPI.endTransaction();
-
-          IPAddress result(ip[0], ip[1], ip[2], ip[3]);
-          if (result == IPAddress(0, 0, 0, 0)) {
-            Serial.println("[DNS] Resolution failed (0.0.0.0)");
-          } else {
-            Serial.printf("[DNS] Resolved to: %d.%d.%d.%d\n", ip[0], ip[1],
-                          ip[2], ip[3]);
-          }
-          return result;
-        }
+      // Finish the 512 byte transfer
+      int consumed = 3 + ((status & STATUS_HAS_DATA) ? 4 : 0);
+      while (consumed < MAX_SPI_BUF) {
+          SPI.transfer(0x00);
+          consumed++;
       }
 
       digitalWrite(_cs, HIGH);
       SPI.endTransaction();
+      
+      if (status & STATUS_HAS_DATA) {
+        if (len == 4) {
+          IPAddress result(ip[0], ip[1], ip[2], ip[3]);
+          Serial.printf("[DNS] SPI RX: %d.%d.%d.%d (Status: 0x%02X, Len: %d)\r\n", 
+                        ip[0], ip[1], ip[2], ip[3], status, len);
+          
+          // CRITICAL: If the result matches our local IP, it's almost certainly stale data
+          // from a previous getLocalIP() call that was still in the ESP32's buffer.
+          if (result != IPAddress(0,0,0,0) && result != _cachedIP) {
+            return result;
+          } else if (result == _cachedIP) {
+            Serial.println("[DNS] Ignoring stale Local IP in SPI buffer, waiting for real result...");
+          }
+        } else {
+          Serial.printf("[DNS] SPI RX Other: Status 0x%02X, Len %d\r\n", status, len);
+        }
+      }
     }
-    delay(100); // Poll every 100ms
+    delay(100);
   }
 
-  Serial.println("[DNS] Timeout");
   return IPAddress(0, 0, 0, 0);
 }
 
 IPAddress EspSpiDriver::getDNSServer() {
   SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
+  delayMicroseconds(50);
 
   SPI.transfer(CMD_GET_DNS);
+  for (int k = 1; k < MAX_SPI_BUF; k++) SPI.transfer(0x00);
 
-  // Padding to flush FIFO
-  for (int k = 0; k < 4; k++) {
-    SPI.transfer(0x00);
-    delayMicroseconds(5);
-  }
-
-  delayMicroseconds(50);
   digitalWrite(_cs, HIGH);
   SPI.endTransaction();
 
-  // Wait for ESP32 response
-  uint32_t startTime = millis();
-  while (millis() - startTime < 2000) { // 2 second timeout
-    if (digitalRead(_ready) == HIGH) {
-      delayMicroseconds(500);
+  delay(100);
 
-      SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-      digitalWrite(_cs, LOW);
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(_cs, LOW);
+  delayMicroseconds(50);
 
-      uint8_t status = SPI.transfer(0x00);
-      if (status & STATUS_HAS_DATA) {
-        uint8_t lenHi = SPI.transfer(0x00);
-        uint8_t lenLo = SPI.transfer(0x00);
-        uint16_t len = (lenHi << 8) | lenLo;
+  uint8_t status = SPI.transfer(0x00);
+  uint8_t lenHi  = SPI.transfer(0x00);
+  uint8_t lenLo  = SPI.transfer(0x00);
+  uint16_t len   = (lenHi << 8) | lenLo;
 
-        if (len == 4) { // IP address is 4 bytes
-          uint8_t ip[4];
-          for (int i = 0; i < 4; i++) {
-            ip[i] = SPI.transfer(0x00);
-          }
-
-          digitalWrite(_cs, HIGH);
-          SPI.endTransaction();
-
-          IPAddress result(ip[0], ip[1], ip[2], ip[3]);
-          Serial.printf("[DNS] Server: %d.%d.%d.%d\n", ip[0], ip[1], ip[2],
-                        ip[3]);
-          return result;
-        }
-      }
-
-      digitalWrite(_cs, HIGH);
-      SPI.endTransaction();
-    }
-    delay(50);
+  uint8_t ip[4] = {0, 0, 0, 0};
+  if ((status & STATUS_HAS_DATA) && len == 4) {
+    for (int i = 0; i < 4; i++) ip[i] = SPI.transfer(0x00);
   }
 
-  Serial.println("[DNS] Timeout getting DNS server");
-  return IPAddress(0, 0, 0, 0);
+  digitalWrite(_cs, HIGH);
+  SPI.endTransaction();
+
+  return IPAddress(ip[0], ip[1], ip[2], ip[3]);
 }
 
 int EspSpiDriver::parsePacket() {
-
-  // If ESP says "Ready", we read.
   if (digitalRead(_ready) == HIGH) {
-    // Race Condition Fix: Give ESP32 time to enter spi_slave_transmit loop
-    // after setting READY pin high.
     delayMicroseconds(500);
 
-    // Use 1MHz for consistency with Config
-    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
     digitalWrite(_cs, LOW);
-
-    // We expect ESP to clock out: [STATUS] [LEN_HI] [LEN_LO] [DATA...]
-    // Since ESP is Slave, we must send Dummy bytes to shift data in.
+    delayMicroseconds(50);
 
     uint8_t status = SPI.transfer(0x00);
 
     if (status == STATUS_CONFIG_CMD) {
-      // Config command from ESP32 web server — route to separate buffer
       uint8_t lenHi = SPI.transfer(0x00);
       uint8_t lenLo = SPI.transfer(0x00);
       uint16_t len = (lenHi << 8) | lenLo;
@@ -280,40 +236,43 @@ int EspSpiDriver::parsePacket() {
         }
         _cfgLen = len;
       }
-
-      // Padding
-      for (int k = 0; k < 4; k++) SPI.transfer(0x00);
-      delayMicroseconds(50);
-
+      // Pad to 512
+      int consumed = 3 + (len < sizeof(_cfgBuffer) ? len : 0);
+      while (consumed < MAX_SPI_BUF) {
+          SPI.transfer(0x00);
+          consumed++;
+      }
       digitalWrite(_cs, HIGH);
       SPI.endTransaction();
-      return 0; // No UDP data — config command stored separately
+      return 0;
     } else if (status & STATUS_HAS_DATA) {
       uint8_t lenHi = SPI.transfer(0x00);
       uint8_t lenLo = SPI.transfer(0x00);
       uint16_t len = (lenHi << 8) | lenLo;
 
       if (len > 0 && len < 512) {
-        // Read Payload
         for (int i = 0; i < len; i++) {
           _rxBuffer[i] = SPI.transfer(0x00);
         }
         _rxLen = len;
       } else {
-        // If len is 0 or invalid, this is weird.
-        Serial.printf("[SPI Debug] Invalid Packet Len=%d (Status=0x%02X)\r\n",
-                      len, status);
         _rxLen = 0;
       }
-    } else {
 
+      // Pad to 512
+      int consumed = 3 + (len > 0 && len < 512 ? len : 0);
+      while (consumed < MAX_SPI_BUF) {
+          SPI.transfer(0x00);
+          consumed++;
+      }
+      digitalWrite(_cs, HIGH);
+      SPI.endTransaction();
+      return _rxLen;
+    } else {
+      // Pad to 512 for idle status
+      for (int k = 1; k < MAX_SPI_BUF; k++) SPI.transfer(0x00);
       _rxLen = 0;
     }
-
-    // Padding for Read (Consistency)
-    for (int k = 0; k < 4; k++)
-      SPI.transfer(0x00);
-    delayMicroseconds(50);
 
     digitalWrite(_cs, HIGH);
     SPI.endTransaction();
@@ -327,46 +286,38 @@ int EspSpiDriver::read(uint8_t *buffer, size_t maxLen) {
   if (_rxLen > 0) {
     size_t copyLen = (_rxLen < (int)maxLen) ? _rxLen : maxLen;
     memcpy(buffer, _rxBuffer, copyLen);
-    _rxLen = 0; // Clear buffer
+    _rxLen = 0;
     return copyLen;
   }
   return 0;
 }
 
-// Stubs
 bool EspSpiDriver::isConnected() { return true; }
 
 IPAddress EspSpiDriver::getLocalIP() {
-  // Return Cached IP if valid (not 0.0.0.0)
-  if (_cachedIP != IPAddress(0, 0, 0, 0)) {
-    return _cachedIP;
+  if (_cachedIP != IPAddress(0, 0, 0, 0)) return _cachedIP;
+
+  // Clear any pending unsolicited data before sending a command
+  while (digitalRead(_ready) == HIGH) {
+    parsePacket();
+    delay(5);
   }
 
-  // Clear any stale buffer state
-  _rxLen = 0;
-
-  // --- Phase 1: Send CMD_GET_IP ---
   SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
-  SPI.transfer(CMD_GET_IP);
-  for (int k = 0; k < 4; k++) {
-    SPI.transfer(0x00);
-    delayMicroseconds(5);
-  }
   delayMicroseconds(50);
+
+  SPI.transfer(CMD_GET_IP);
+  for (int k = 1; k < MAX_SPI_BUF; k++) SPI.transfer(0x00);
   digitalWrite(_cs, HIGH);
   SPI.endTransaction();
 
-  // --- Phase 2: Wait for ESP32 to process and re-arm ---
-  // The ESP32 needs time to: complete spi_slave_transmit, process CMD_GET_IP,
-  // prepare the response in sendbuf, and re-arm spi_slave_transmit.
+  // Master uses 100ms delay for IP retrieval
   delay(100);
 
-  // --- Phase 3: Blind read (bypass READY pin) ---
-  // Directly clock out the response. The ESP32's DMA buffer should contain
-  // [STATUS] [LEN_HI] [LEN_LO] [IP0] [IP1] [IP2] [IP3]
   SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
+  delayMicroseconds(50);
 
   uint8_t status = SPI.transfer(0x00);
   uint8_t lenHi  = SPI.transfer(0x00);
@@ -375,35 +326,26 @@ IPAddress EspSpiDriver::getLocalIP() {
 
   uint8_t ip[4] = {0, 0, 0, 0};
   if ((status & STATUS_HAS_DATA) && len == 4) {
-    for (int i = 0; i < 4; i++) {
-      ip[i] = SPI.transfer(0x00);
-    }
+    for (int i = 0; i < 4; i++) ip[i] = SPI.transfer(0x00);
   }
 
-  // Padding for consistency
-  for (int k = 0; k < 4; k++) SPI.transfer(0x00);
-  delayMicroseconds(50);
+  // Pad to 512
+  int consumed = 3 + (len == 4 ? 4 : 0);
+  while (consumed < MAX_SPI_BUF) {
+      SPI.transfer(0x00);
+      consumed++;
+  }
 
   digitalWrite(_cs, HIGH);
   SPI.endTransaction();
 
-
-
   IPAddress result(ip[0], ip[1], ip[2], ip[3]);
-  if (result != IPAddress(0, 0, 0, 0)) {
-    _cachedIP = result;
-  }
+  if (result != IPAddress(0, 0, 0, 0)) _cachedIP = result;
   return result;
 }
 
-IPAddress EspSpiDriver::getSubnetMask() {
-  return IPAddress(0, 0, 0, 0); // Not supported over SPI yet
-}
-
-IPAddress EspSpiDriver::getGateway() {
-  return IPAddress(0, 0, 0, 0); // Not supported over SPI yet
-}
-
+IPAddress EspSpiDriver::getSubnetMask() { return IPAddress(0, 0, 0, 0); }
+IPAddress EspSpiDriver::getGateway() { return IPAddress(0, 0, 0, 0); }
 IPAddress EspSpiDriver::getDNS() { return getDNSServer(); }
 
 void EspSpiDriver::setTarget(IPAddress ip, uint16_t port) {
@@ -411,27 +353,18 @@ void EspSpiDriver::setTarget(IPAddress ip, uint16_t port) {
   _targetPort = port;
 }
 
-// --- Config Management (for ESP32 Web Server) ---
-
 void EspSpiDriver::pushConfig(const void *configData, uint16_t configLen) {
-  // Send the raw SysConfig struct to the ESP32 via CMD_PUSH_CONFIG
-  // Format: [CMD_PUSH_CONFIG] [LEN_HI] [LEN_LO] [config bytes...]
-  if (configLen > 500) return; // Safety check
-
-  // Pace before starting a new transaction
+  if (configLen > 500) return;
   delay(5);
 
   SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
   delayMicroseconds(50);
 
-  // Check status byte first to see if we're colliding with a UDP packet
   uint8_t status = SPI.transfer(CMD_PUSH_CONFIG);
   if (status & STATUS_HAS_DATA) {
-      // Collision! ESP32 has data for us. Abort push to prevent corruption.
       digitalWrite(_cs, HIGH);
       SPI.endTransaction();
-      Serial.println("[SPI] Config push aborted: UDP data pending on ESP32");
       return;
   }
 
@@ -441,29 +374,26 @@ void EspSpiDriver::pushConfig(const void *configData, uint16_t configLen) {
   const uint8_t *data = (const uint8_t *)configData;
   for (uint16_t i = 0; i < configLen; i++) {
     SPI.transfer(data[i]);
-    // Pace the transfer to avoid overrunning the ESP32's DMA
-    if (i % 64 == 63) delayMicroseconds(10);
   }
 
-  // Padding
-  for (int k = 0; k < 4; k++) SPI.transfer(0x00);
-  delayMicroseconds(50);
+  // Pad to 512
+  int sent = 3 + configLen;
+  while (sent < MAX_SPI_BUF) {
+      SPI.transfer(0x00);
+      sent++;
+  }
 
   digitalWrite(_cs, HIGH);
   SPI.endTransaction();
-
-  Serial.printf("[SPI] Pushed config to ESP32 (%d bytes)\r\n", configLen);
 }
 
-bool EspSpiDriver::hasConfigCmd() {
-  return _cfgLen > 0;
-}
+bool EspSpiDriver::hasConfigCmd() { return _cfgLen > 0; }
 
 int EspSpiDriver::readConfigCmd(uint8_t *buffer, size_t maxLen) {
   if (_cfgLen > 0) {
     size_t copyLen = (_cfgLen < (int)maxLen) ? _cfgLen : maxLen;
     memcpy(buffer, _cfgBuffer, copyLen);
-    _cfgLen = 0; // Clear buffer
+    _cfgLen = 0;
     return copyLen;
   }
   return 0;

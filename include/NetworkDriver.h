@@ -30,8 +30,16 @@ public:
   // Data - Simplified for UDP Voter Protocol
   virtual void setTarget(IPAddress ip, uint16_t port) = 0;
   virtual void sendPacket(const uint8_t *data, uint16_t len) = 0;
+  virtual void sendPacketTo(IPAddress ip, uint16_t port, const uint8_t *data,
+                            uint16_t len) = 0;
   virtual int parsePacket() = 0;
   virtual int read(uint8_t *buffer, size_t maxLen) = 0;
+  virtual IPAddress resolveHostname(const char *hostname) = 0;
+  virtual void setYieldCallback(void (*cb)()) { _yieldCb = cb; }
+
+protected:
+  void (*_yieldCb)() = nullptr;
+  void _yield() { if (_yieldCb) _yieldCb(); }
 };
 
 #endif

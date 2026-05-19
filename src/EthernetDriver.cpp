@@ -18,29 +18,29 @@ bool EthernetDriver::begin(uint8_t *mac) {
   }
   Serial.println("[Ethernet] Hardware detected!");
 
-  Serial.println("[Ethernet] Checking link status...");
-  if (Ethernet.linkStatus() == LinkOFF) {
-    Serial.println("[Ethernet] Link status reports OFF.");
-    Serial.println("[Ethernet] NOTE: Header-based adapters may not report link "
-                   "correctly.");
-    Serial.println("[Ethernet] Attempting DHCP anyway (5s timeout)...");
-    // Don't return false - try DHCP anyway for header-based adapters
-  } else {
-    Serial.println("[Ethernet] Link is UP!");
+  Serial.println("[Ethernet] Waiting for Link (up to 2s)...");
+  for (int i = 0; i < 20; i++) {
+    if (Ethernet.linkStatus() != LinkOFF) break;
+    delay(100);
   }
 
-  // Try DHCP with timeout (10 seconds instead of default 60)
-  Serial.println("[Ethernet] Requesting DHCP (10s timeout)...");
-  if (Ethernet.begin(_mac, 10000) == 0) {
+  if (Ethernet.linkStatus() == LinkOFF) {
+    Serial.println("[Ethernet] Link status reports OFF.");
+    Serial.println("[Ethernet] NOTE: Header-based adapters may not report link correctly.");
+    Serial.println("[Ethernet] Attempting DHCP anyway...");
+  } else {
+    Serial.println("[Network] ✓ Ethernet Link is UP!");
+  }
+
+  // Log MAC address being used
+  Serial.printf("[Ethernet] MAC Address: %02X:%02X:%02X:%02X:%02X:%02X\r\n", 
+                _mac[0], _mac[1], _mac[2], _mac[3], _mac[4], _mac[5]);
+
+  // Try DHCP with timeout (15 seconds)
+  Serial.println("[Ethernet] Requesting DHCP...");
+  if (Ethernet.begin(_mac, 15000) == 0) {
     Serial.println("[Ethernet] DHCP Failed!");
-    // Check for link again
-    if (Ethernet.linkStatus() != LinkOFF) {
-      Serial.println("[Ethernet] Link is UP but DHCP failed. Configuring "
-                     "Static IP 192.168.1.177");
-      Ethernet.begin(_mac, IPAddress(192, 168, 1, 177));
-    } else {
-      return false;
-    }
+    return false;
   }
 
   _linkStatus = true;
@@ -133,6 +133,22 @@ void EthernetDriver::sendPacket(const uint8_t *data, uint16_t len) {
   }
 }
 
+void EthernetDriver::sendPacketTo(IPAddress ip, uint16_t port,
+                                 const uint8_t *data, uint16_t len) {
+  if (!isConnected())
+    return;
+
+  // Optimized for NativeEthernet - Avoid redundant calls
+  if (_udp.beginPacket(ip, port)) {
+    _udp.write(data, len);
+    if (!_udp.endPacket()) {
+        // Serial.println("[Ethernet] UDP Send Failed");
+    }
+  } else {
+      // Serial.println("[Ethernet] UDP Begin Failed");
+  }
+}
+
 int EthernetDriver::parsePacket() { return _udp.parsePacket(); }
 
 int EthernetDriver::read(uint8_t *buffer, size_t maxLen) {
@@ -140,122 +156,98 @@ int EthernetDriver::read(uint8_t *buffer, size_t maxLen) {
 }
 
 IPAddress EthernetDriver::resolveHostname(const char *hostname) {
-  Serial.printf("[Ethernet] Resolving hostname: %s\r\n", hostname);
+  if (!hostname || hostname[0] == '\0') return IPAddress(0, 0, 0, 0);
+  
+  // If it's already an IP, return it
+  IPAddress result;
+  if (result.fromString(hostname)) return result;
 
-  // Get DNS server from Ethernet configuration
+  Serial.printf("[Ethernet] Resolving hostname: %s\r\n", hostname);
+  
   IPAddress dnsServer = Ethernet.dnsServerIP();
   if (dnsServer == IPAddress(0, 0, 0, 0)) {
-    Serial.println("[Ethernet] No DNS server configured!");
+    Serial.println("[Ethernet] No DNS server configured");
     return IPAddress(0, 0, 0, 0);
   }
 
-  Serial.printf("[Ethernet] Using DNS server: %u.%u.%u.%u\r\n", dnsServer[0],
-                dnsServer[1], dnsServer[2], dnsServer[3]);
-
-  // Build DNS query packet
-  uint8_t dnsQuery[512];
-  uint16_t queryLen = 0;
-
-  // DNS Header (12 bytes)
-  dnsQuery[queryLen++] = 0x00;
-  dnsQuery[queryLen++] = 0x01; // Transaction ID
-  dnsQuery[queryLen++] = 0x01;
-  dnsQuery[queryLen++] = 0x00; // Flags: standard query
-  dnsQuery[queryLen++] = 0x00;
-  dnsQuery[queryLen++] = 0x01; // Questions: 1
-  dnsQuery[queryLen++] = 0x00;
-  dnsQuery[queryLen++] = 0x00; // Answer RRs: 0
-  dnsQuery[queryLen++] = 0x00;
-  dnsQuery[queryLen++] = 0x00; // Authority RRs: 0
-  dnsQuery[queryLen++] = 0x00;
-  dnsQuery[queryLen++] = 0x00; // Additional RRs: 0
-
-  // Question section: convert hostname to DNS format
-  // e.g., "voter.example.com" -> 5voter7example3com0
-  const char *label = hostname;
-  while (*label) {
-    const char *dot = strchr(label, '.');
-    uint8_t labelLen = dot ? (dot - label) : strlen(label);
-    dnsQuery[queryLen++] = labelLen;
-    memcpy(&dnsQuery[queryLen], label, labelLen);
-    queryLen += labelLen;
-    label += labelLen;
-    if (dot)
-      label++; // Skip the dot
-    else
-      break;
-  }
-  dnsQuery[queryLen++] = 0x00; // End of hostname
-
-  // Query type: A (IPv4 address)
-  dnsQuery[queryLen++] = 0x00;
-  dnsQuery[queryLen++] = 0x01;
-  // Query class: IN (Internet)
-  dnsQuery[queryLen++] = 0x00;
-  dnsQuery[queryLen++] = 0x01;
-
-  // Send DNS query
   EthernetUDP dnsUdp;
-  dnsUdp.begin(0); // Use random local port
+  dnsUdp.begin(1024 + (millis() % 1000)); // Random local port
 
-  if (!dnsUdp.beginPacket(dnsServer, 53)) {
-    Serial.println("[Ethernet] Failed to begin DNS packet");
-    dnsUdp.stop();
-    return IPAddress(0, 0, 0, 0);
+  uint8_t packet[512];
+  memset(packet, 0, 12);
+  packet[1] = 0x01; // ID
+  packet[5] = 0x01; // 1 Question
+  packet[2] = 0x01; // RD = 1 (Recursion Desired)
+
+  int pos = 12;
+  const char *p = hostname;
+  while (*p) {
+    const char *dot = strchr(p, '.');
+    int len = dot ? (dot - p) : strlen(p);
+    packet[pos++] = (uint8_t)len;
+    memcpy(&packet[pos], p, len);
+    pos += len;
+    p += len;
+    if (dot) p++;
+  }
+  packet[pos++] = 0; // End of name
+  packet[pos++] = 0; packet[pos++] = 1; // Type A
+  packet[pos++] = 0; packet[pos++] = 1; // Class IN
+
+  if (dnsUdp.beginPacket(dnsServer, 53)) {
+    dnsUdp.write(packet, pos);
+    dnsUdp.endPacket();
   }
 
-  dnsUdp.write(dnsQuery, queryLen);
-  dnsUdp.endPacket();
-
-  // Wait for response (timeout: 5 seconds)
-  unsigned long startTime = millis();
-  while (millis() - startTime < 5000) {
-    int packetSize = dnsUdp.parsePacket();
-    if (packetSize > 0) {
-      uint8_t dnsResponse[512];
-      int len = dnsUdp.read(dnsResponse, sizeof(dnsResponse));
-
-      // Parse DNS response
-      // Skip header (12 bytes) and question section
-      int pos = 12;
-
-      // Skip question section (same format as query)
-      while (pos < len && dnsResponse[pos] != 0) {
-        pos += dnsResponse[pos] + 1;
+  uint32_t start = millis();
+  while (millis() - start < 3000) {
+    _yield(); // Allow GPS and other tasks to run
+    int len = dnsUdp.parsePacket();
+    if (len >= 12) {
+      dnsUdp.read(packet, sizeof(packet)); // Actually read the data!
+      if (packet[0] == 0x00 && packet[1] == 0x01) { // Check ID
+        int qCount = (packet[4] << 8) | packet[5];
+        int aCount = (packet[6] << 8) | packet[7];
+        
+        int cur = 12;
+      // Skip Questions with bounds safety
+      for (int i = 0; i < qCount && cur < len - 5; i++) {
+        while (cur < len && packet[cur] != 0) {
+          if ((packet[cur] & 0xC0) == 0xC0) { cur += 2; break; }
+          cur += packet[cur] + 1;
+        }
+        if (cur < len && packet[cur] == 0) cur++;
+        cur += 4; // type + class
       }
-      pos += 5; // Skip null terminator + type + class
-
-      // Parse answer section
-      if (pos + 12 <= len) {
-        // Skip name (usually compressed pointer)
-        if ((dnsResponse[pos] & 0xC0) == 0xC0) {
-          pos += 2; // Compressed name pointer
+      
+      // Parse Answers with bounds safety
+      for (int i = 0; i < aCount && cur < len - 10; i++) {
+        // Skip name
+        if ((packet[cur] & 0xC0) == 0xC0) cur += 2;
+        else {
+            while (cur < len && packet[cur] != 0) cur += packet[cur] + 1; 
+            if (cur < len) cur++;
         }
-
-        uint16_t type = (dnsResponse[pos] << 8) | dnsResponse[pos + 1];
-        pos += 8; // Skip type, class, TTL
-
-        uint16_t dataLen = (dnsResponse[pos] << 8) | dnsResponse[pos + 1];
-        pos += 2;
-
-        if (type == 1 && dataLen == 4 && pos + 4 <= len) {
-          // Type A (IPv4 address)
-          IPAddress resolvedIP(dnsResponse[pos], dnsResponse[pos + 1],
-                               dnsResponse[pos + 2], dnsResponse[pos + 3]);
-
-          Serial.printf("[Ethernet] DNS resolved to: %u.%u.%u.%u\r\n",
-                        resolvedIP[0], resolvedIP[1], resolvedIP[2],
-                        resolvedIP[3]);
-
+        
+        if (cur > len - 10) break;
+        uint16_t type = (packet[cur] << 8) | packet[cur+1];
+        uint16_t rdlen = (packet[cur+8] << 8) | packet[cur+9];
+        cur += 10;
+        
+        if (type == 1 && rdlen == 4 && cur <= len - 4) { // Type A
+          IPAddress resolved(packet[cur], packet[cur+1], packet[cur+2], packet[cur+3]);
           dnsUdp.stop();
-          return resolvedIP;
+          Serial.printf("[Ethernet] Resolved to: %u.%u.%u.%u\r\n", resolved[0], resolved[1], resolved[2], resolved[3]);
+          return resolved;
         }
+        cur += rdlen;
+      }
       }
     }
     delay(10);
   }
 
-  Serial.println("[Ethernet] DNS query timeout");
   dnsUdp.stop();
+  Serial.println("[Ethernet] DNS Timeout/Failure");
   return IPAddress(0, 0, 0, 0);
 }

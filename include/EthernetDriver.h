@@ -27,11 +27,13 @@ public:
   // Data
   virtual void setTarget(IPAddress ip, uint16_t port) override;
   virtual void sendPacket(const uint8_t *data, uint16_t len) override;
+  virtual void sendPacketTo(IPAddress ip, uint16_t port, const uint8_t *data,
+                            uint16_t len) override;
   virtual int parsePacket() override;
   virtual int read(uint8_t *buffer, size_t maxLen) override;
 
   // DNS Resolution
-  IPAddress resolveHostname(const char *hostname);
+  virtual IPAddress resolveHostname(const char *hostname) override;
 
 private:
   EthernetUDP _udp;

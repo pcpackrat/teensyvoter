@@ -2,18 +2,21 @@
 #define CONFIG_MANAGER_H
 
 #include <Arduino.h>
+#ifndef ESP32
 #include <EEPROM.h>
 #include <NativeEthernet.h>
+#endif
 
 // Magic Header to detect valid config
 #define CONFIG_MAGIC 0x564F5452 // "VOTR"
-#define CONFIG_VERSION 22       // Natural alignment version
+#define CONFIG_VERSION 24       // Added Syslog Hostname Support
 
 // COS/Squelch Modes
 #define COS_MODE_ALWAYS_ON 0 // Always send RSSI (testing/no squelch)
 #define COS_MODE_HARDWARE 1  // Use GPIO pin for COS
 #define COS_MODE_DSP 2       // Use DSP noise detection
 
+#pragma pack(push, 1)
 struct SysConfig {
   // 32-bit fields
   uint32_t magic;
@@ -25,6 +28,7 @@ struct SysConfig {
   uint32_t staticDNS;
   uint32_t dnsServerIP;
   float dspCalib;
+  uint32_t syslogIP;
 
   // 16-bit fields
   uint16_t hostPort;
@@ -32,6 +36,7 @@ struct SysConfig {
   uint16_t rssiMax;
   int16_t timingOffsetMs;
   uint16_t pttTailMs;
+  uint16_t syslogPort;
 
   // 8-bit / bool fields
   uint8_t mac[6];
@@ -47,14 +52,17 @@ struct SysConfig {
   bool enablePLFilter;
   bool enableDeemp;
   bool pttInvert;
+  bool useSyslog;
 
   // Strings (byte arrays)
   char hostname[64];
+  char syslogHostname[64];
   char clientPwd[20];
   char hostPwd[20];
   char wifiSSID[32];
   char wifiPass[64];
 };
+#pragma pack(pop)
 
 class ConfigManager {
 public:

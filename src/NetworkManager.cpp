@@ -25,6 +25,12 @@ void NetworkManager::sendPacket(const uint8_t *data, uint16_t length) {
     _driver->sendPacket(data, length);
 }
 
+void NetworkManager::sendPacketTo(IPAddress ip, uint16_t port,
+                                 const uint8_t *data, uint16_t length) {
+  if (_driver)
+    _driver->sendPacketTo(ip, port, data, length);
+}
+
 int NetworkManager::parsePacket() {
   if (_driver)
     return _driver->parsePacket();
@@ -35,6 +41,12 @@ int NetworkManager::read(uint8_t *buffer, size_t maxLen) {
   if (_driver)
     return _driver->read(buffer, maxLen);
   return 0;
+}
+
+IPAddress NetworkManager::resolveHostname(const char *hostname) {
+  if (_driver)
+    return _driver->resolveHostname(hostname);
+  return IPAddress(0, 0, 0, 0);
 }
 
 bool NetworkManager::isConnected() {

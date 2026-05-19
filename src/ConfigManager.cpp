@@ -32,12 +32,17 @@ void ConfigManager::resetDefaults() {
   // Default MAC (Teensy 4.1 reads real MAC from OCOTP usually, but we will
   // store override) Actually, NativeEthernet reads the hardware MAC. We only
   // need to store it if we want to spoof it. Let's set a dummy default.
-  data.mac[0] = 0xDE;
-  data.mac[1] = 0xAD;
-  data.mac[2] = 0xBE;
-  data.mac[3] = 0xEF;
-  data.mac[4] = 0xFE;
-  data.mac[5] = 0xED;
+  // Generate a unique MAC based on Teensy serial number
+  uint32_t serial = 0;
+  // Read Teensy 4.1 serial from OCOTP
+  serial = HW_OCOTP_CFG0 ^ HW_OCOTP_CFG1; 
+  
+  data.mac[0] = 0x04; // Teensy prefix
+  data.mac[1] = 0xE9;
+  data.mac[2] = 0xE5;
+  data.mac[3] = (serial >> 16) & 0xFF;
+  data.mac[4] = (serial >> 8) & 0xFF;
+  data.mac[5] = serial & 0xFF;
 
   // Default Host: 10.10.10.42 : 667
   data.hostname[0] = '\0'; // Empty hostname by default
@@ -84,6 +89,12 @@ void ConfigManager::resetDefaults() {
   // PTT Defaults
   data.pttInvert = true; // Default: Active Low (Industry Standard)
   data.pttTailMs = 500;  // Default: 500ms tail (Eliminates flickering/popping)
+
+  // Syslog Defaults
+  data.syslogIP = 0;
+  data.syslogPort = 514;
+  data.useSyslog = false;
+  memset(data.syslogHostname, 0, sizeof(data.syslogHostname));
 
   save();
   Serial.println("[Config] Reset to Defaults\r");

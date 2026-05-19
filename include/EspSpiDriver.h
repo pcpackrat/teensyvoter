@@ -22,13 +22,16 @@ public:
 
   void setTarget(IPAddress ip, uint16_t port) override;
   void sendPacket(const uint8_t *data, uint16_t len) override;
+  void sendPacketTo(IPAddress ip, uint16_t port, const uint8_t *data,
+                    uint16_t len) override;
   int parsePacket() override;
   int read(uint8_t *buffer, size_t maxLen) override;
 
   // WiFi Specific
   void setCredentials(const char *ssid, const char *pass);
-  IPAddress resolveHostname(const char *hostname);
+  IPAddress resolveHostname(const char *hostname) override;
   IPAddress getDNSServer();
+  void setStaticDNS(IPAddress dns) { _staticDNS = dns; }
 
   // Config Management (for ESP32 web server)
   void pushConfig(const void *configData, uint16_t configLen);
@@ -40,6 +43,7 @@ private:
   IPAddress _targetIP;
   uint16_t _targetPort;
   IPAddress _cachedIP; // IP Cache
+  IPAddress _staticDNS;
 
   // Buffers
   uint8_t _rxBuffer[512];
@@ -50,7 +54,7 @@ private:
   int _cfgLen;
 
   // SPI Helpers
-  void _spiTransfer(uint8_t *data, size_t len);
+  bool _waitReady(uint32_t timeoutMs);
   uint8_t _readStatus();
 };
 

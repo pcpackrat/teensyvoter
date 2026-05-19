@@ -1,5 +1,6 @@
 #include "VoterClient.h"
 #include <stdint.h>
+#include "Logger.h"
 
 // Local byte-swap helpers with unique names to avoid toolchain builtin issues
 // Compiler intrinsics for ARM Cortex-M7 (Teensy 4.1) - Little Endian to Network
@@ -154,8 +155,8 @@ void VoterClient::update() {
             ts);
       }
 
-      // Only disconnect if lock is lost for > 60,000ms (1 minute)
-      if (millis() - _gpsLostTime > 60000) {
+      // Disconnect if lock is lost for > 1,000ms (1 second) - Immediate Fail-safe
+      if (millis() - _gpsLostTime > 1000) {
         GPSManager::GPSLockStatus status = _gps->getLockStatus();
         char ts[20];
         _gps->getTimestamp(ts);
@@ -182,6 +183,7 @@ void VoterClient::update() {
         _state = VOTER_DISCONNECTED;
         _lastAttemptTime = millis(); // Force delay
         _gpsLostTime = 0;            // Reset
+        logger.error("VOTER", "Disconnected: GPS Holdover Expired");
         return;
       }
     } else {
@@ -368,6 +370,8 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
         _authError = AUTH_ERR_NONE;
         _authAttempts = 0; // Success!
         _lastGPSSend = millis();
+        logger.info("VOTER", "Connected to Host %u.%u.%u.%u:%u", _hostIP[0],
+                    _hostIP[1], _hostIP[2], _hostIP[3], _hostPort);
       }
 
       if (type == PAYLOAD_ULAW) {

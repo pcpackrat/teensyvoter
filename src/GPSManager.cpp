@@ -1,5 +1,6 @@
 #include "GPSManager.h"
 #include <TimeLib.h> // Teensy Time library
+#include "Logger.h"
 
 GPSManager *GPSManager::_instance = nullptr;
 
@@ -27,20 +28,18 @@ void GPSManager::_handlePPS() {
   uint32_t now = micros();
   uint32_t delta = now - _lastPpsMicros;
 
-  // Simple debouncing: ignore if less than 900ms has passed
-  if (delta > 900000) {
-    _ppsPeriod = delta;
+    // Simple debouncing: ignore if less than 900ms has passed
+    if (delta > 900000) {
+        _ppsPeriod = delta;
+        _lastPpsMicros = now;
+        _ppsTriggered = true;
 
-    // CRITICAL FIX: Increment epoch BEFORE updating _lastPpsMicros
-    // This way, _currentEpoch represents the second that just started
-    // and _lastPpsMicros marks the beginning of that second
-    if (_validTime) {
-      _currentEpoch++;
+        // Only increment epoch if we've already had a valid NMEA sync
+        // AND the last NMEA update wasn't too recent (avoiding double-increment)
+        if (_validTime) {
+            _currentEpoch++;
+        }
     }
-
-    _lastPpsMicros = now;
-    _ppsTriggered = true;
-  }
 }
 
 bool GPSManager::checkPPS() {
@@ -85,22 +84,22 @@ void GPSManager::update() {
       // We set the base _currentEpoch.
       // The PPS interrupt handles incrementing it for the *next* second.
 
-      // Safety check: Don't jump backward massively if we are already locked
+      // Safety check: Update Epoch from NMEA
       time_t gpsTime = makeTime(tm);
+      
+      // If we are significantly off, or it's our first sync, hard-set the epoch
       if (!_validTime || abs((int64_t)gpsTime - (int64_t)_currentEpoch) >= 1) {
-        _currentEpoch = gpsTime;
-        _validTime = true;
-
-        // CRITICAL SYNC FIX: If we just updated the epoch from NMEA (e.g. during holdover),
-        // we must also align _lastPpsMicros to the virtual second boundary.
-        // Otherwise, getNetworkTime() will add holdover seconds on top of this new epoch.
-        uint32_t age = _gpsParser.time.age();
-        noInterrupts();
-        _lastPpsMicros = micros() - (age * 1000);
-        interrupts();
-
-        // Sync Teensy RTC as well
-        Teensy3Clock.set(gpsTime);
+          uint32_t age = _gpsParser.time.age();
+          
+          noInterrupts();
+          _currentEpoch = gpsTime;
+          _validTime = true;
+          // Re-align PPS marker to the reported age of this NMEA sentence
+          _lastPpsMicros = micros() - (age * 1000);
+          interrupts();
+          
+          // Sync Teensy RTC
+          Teensy3Clock.set(gpsTime);
       }
     }
   }
@@ -156,16 +155,13 @@ void GPSManager::update() {
       Serial.printf(
           "%s [GPS] Context: Serial Timeout. Age: %u ms (Limit: 10000)\r\n", ts,
           age);
-    } else if (_stableStatus == GPS_LOCKED) {
-      if (_ppsPeriod < 5000000) {
-        Serial.printf(
-            "%s [GPS] Context: Fix Restored. Sats: %u, PPS Period: %u us\r\n",
-            ts, getSatellites(), _ppsPeriod);
-      } else {
-        Serial.printf("%s [GPS] Context: Fix Restored. Sats: %u\r\n", ts,
-                      getSatellites());
-      }
+    } else {
+      Serial.printf("%s [GPS] Context: Fix Restored. Sats: %u\r\n", ts,
+                    getSatellites());
     }
+
+    // Remote Logging
+    logger.warn("GPS", "Status Change: %s -> %s (Sats: %u)", oldStr, newStr, getSatellites());
 
     _lastLoggedStatus = _stableStatus;
   }
@@ -200,12 +196,12 @@ GPSManager::GPSLockStatus GPSManager::_getRawLockStatus() {
   uint32_t now = micros();
   uint32_t ppsAge = (now >= _lastPpsMicros) ? (now - _lastPpsMicros) : 0;
 
-  bool ppsActive = ppsAge < 5000000;
+  bool ppsActive = ppsAge < 2000000; // Snappier detection (2s)
   if (!ppsActive) {
     return GPS_LOST_PPS;
   }
 
-  bool serialActive = _gpsParser.time.age() < 10000;
+  bool serialActive = _gpsParser.time.age() < 2000; // Snappier detection (2s)
   if (!serialActive) {
     return GPS_LOST_SERIAL;
   }
