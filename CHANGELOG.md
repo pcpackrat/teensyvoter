@@ -339,12 +339,22 @@ Replace simple averaging with proper `arm_fir_decimate_f32()`:
 
 ---
 
-## [Unreleased / Detected] - 2026-01-12
+## 2026-05-19 - Release v1.1.0 (Web Config, Logger, and Technical Debt Cleanup)
 
-### Critical Issues
-- **DSP Buffer Overflow Risk**: `DSPProcessor.h` sizing mismatch. State buffers allocated for 128 samples, but DSP initialized for 160 samples (Lines 42-43 vs Line 8). Potential memory corruption.
-- **Hardcoded Credentials**: WiFi SSID/Password hardcoded in `main.cpp` (Line 542).
+### Features & Refactors
+1. **Teensy Web Server**:
+   - Replaced old skeleton `WebServer.cpp`/`WebServer.h` with a fully featured, robust HTTP server implemented in `TeensyWebServer.cpp`/`TeensyWebServer.h`.
+   - Web interface operates over native Ethernet, providing web-based system configuration, network administration, and diagnostics.
+2. **Unified Logging System**:
+   - Implemented `Logger.cpp`/`Logger.h` for clean and standardized level-based logging (INFO, WARN, ERROR) across code modules.
+3. **SPI WiFi Co-Processor Integration**:
+   - Streamlined `EspSpiDriver` for reliable packet forwarding and configurable WiFi credentials.
+4. **Documentation Audit & Update**:
+   - Performed comprehensive audit of the `docs` folder.
+   - Updated system architecture, feature catalog, known issues list, network data structures, and the power-on checklist (correcting CS pin 10 to 26).
 
-### Identified Technical Debt
-- **Missing Fallback**: No logic for GPS loss (sends timestamp 0).
-- **Web Interface**: `WebInterface.cpp` is a skeleton/stub.
+### Bug Fixes
+- **DSP State Buffer Overflow**: Corrected mismatch where buffers were sized for 128 samples but initialized for 160. Sized to `DSP_BLOCK_SAMPLES + 24`.
+- **WiFi Credentials**: Removed hardcoded credentials from code, migrating them to the configurable `SysConfig` store.
+- **GPS Fallback**: Replaced unsafe GPS loss behavior with an automatic client disconnect after a 1-second holdover timeout.
+
