@@ -26,8 +26,8 @@ TeensyVoter is a replacement firmware for radio voting receivers. It captures au
 The 44.1kHz stream undergoes a multi-stage DSP pipeline to match the 8kHz requirement of the Voter protocol while maintaining high quality.
 
 1. **Anti-Aliasing Filter**:
-   - Single-pole IIR Low-Pass Filter (~3kHz) applied to 44.1kHz stream.
-   - Prevents aliasing during downsampling.
+   - Hardware `AudioFilterBiquad` (2 stages, 3.6kHz cutoff, 24dB/octave) in the Teensy audio path before it enters the record queue.
+   - Prevents high-frequency aliasing during downsampling.
 
 2. **Fractional Resampling (Decimation)**:
    - Converts 44.1kHz → 8kHz.
@@ -38,20 +38,21 @@ The 44.1kHz stream undergoes a multi-stage DSP pipeline to match the 8kHz requir
    - Samples accumulated into 160-sample frames (20ms length).
    - GPS Timestamp captured exactly when frame is full.
 
-4. **Audio Filtering (CMSIS-DSP)**:
-   - **PL Filter**: FIR Bandpass (300Hz - 3300Hz) to remove CTCSS tones and shaped noise.
-   - **De-Emphasis**: IIR Low-Pass (Alpha 0.20) to restore FM audio balance.
-   - **RSSI Calculation**: RMS measurement of High-Passed (>2.4kHz) noise content (for DSP Squelch/RSSI).
+4. **Audio Filtering**:
+   - **Voice Filter**: 65-tap FIR Bandpass (300Hz - 2400Hz @ 8kHz) implemented via a custom circular-buffered `VoiceFilter` class to remove CTCSS (PL) tones and out-of-band noise.
+   - **De-Emphasis**: Single-pole IIR Low-Pass (Alpha 0.20) to restore FM audio balance.
+   - **RSSI Calculation**: RMS measurement of High-Passed (>2.4kHz) noise content (using CMSIS-DSP `_rssiFilter` for DSP Squelch/RSSI).
 
 5. **Encoding**:
-   - Linear PCM → uLaw (G.711) compression.
+   - Linear PCM → uLaw (G.711) compression (using bias 33).
 
 ### 3. Precise Timing (The "Voter" Standard)
 - **GPS Manager**: Tracks Global Time using PPS interrupt + NMEA data.
 - **Interpolation**: Microsecond-precision timestamping between PPS pulses.
-- **Backdating**:
-  - To match Voter2 reference behavior, packets are sent with the timestamp of the *previous* frame (~20ms lag).
-  - This ensures steady timing flow at the server and prevents "future packet" rejection.
+- **Strict Frame Counting (Dead Reckoning)**:
+  - To match the timing expectation of the Asterisk/App_Rpt voter server and prevent jitter, the transmission is anchored to the GPS time at keyup.
+  - Subsequent packet timestamps are calculated continuously as `Base Time + (Frame Count * 20ms)`.
+  - A configurable delay offset (default `-180ms`) is applied to position the timestamps within the server's jitter buffer window.
 
 ### 4. Networking
 - **Protocol**: Cisco/Motorola Voter Protocol (UDP).

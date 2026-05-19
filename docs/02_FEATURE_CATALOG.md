@@ -9,10 +9,10 @@
 | **F05** | **GPS Timing** | ✅ Full | Microsecond precision via PPS. NMEA parsing. Epoch tracking. Jitter correction. |
 | **F06** | **Voter Protocol** | ✅ Full | Authentication (Challenge/Response), Audio Frames (Type 0), Keepalives, Legacy GPS Packets. |
 | **F07** | **Fractional Resampling** | ✅ Full | Linear Interpolator fixes 44.1k/8k drift issues. Includes anti-aliasing. |
-| **F08** | **Configuration** | ✅ Full | Serial CLI Menu. Persisted to EEPROM (LittleFS/EEPROM abstraction via ConfigManager). |
-| **F09** | **Web Interface** | ⚠️ Skeleton | `WebInterface.cpp` exists but updates are minimal/placeholder. Dependencies on WiFi. |
-| **F10** | **WiFi/ESP32 Support** | ⚠️ Partial | `EspSpiDriver` implements basic packet passing. Credentials currently hardcoded in `main.cpp`. |
+| **F08** | **Configuration** | ✅ Full | Serial CLI Menu. Persisted to EEPROM via ConfigManager. |
+| **F09** | **Web Interface** | ✅ Full | Web server implemented in `TeensyWebServer.cpp` serving HTML configuration pages over Native Ethernet. |
+| **F10** | **WiFi/ESP32 Support** | ✅ Full | `EspSpiDriver` provides SPI-to-WiFi bridging. Credentials are configurable via Serial CLI or Web Interface and stored in EEPROM. |
 
-## Detected Discrepancies vs Old Docs
-- **Web Interface**: Documentation implies a functional web UI, but code shows it is largely a stub or minimal status page.
-- **WiFi Config**: There is no CLI menu to set WiFi SSID/Password. It uses hardcoded strings in `main.cpp` ("ImWatchinYou", "n0Password").
+## Feature Status Updates
+- **Web Interface**: A fully functional HTTP web server has been implemented, allowing remote status monitoring and editing configuration settings over the native Ethernet port.
+- **WiFi Config**: SSID and Password settings are now stored in the `SysConfig` EEPROM structure and can be modified through the Network CLI menu or Web UI instead of being hardcoded in `main.cpp`.

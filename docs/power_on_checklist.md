@@ -3,7 +3,7 @@ Power-On & First-Boot Checklist for TeensyVoter
 1. Physical wiring review
    - Verify Teensy 4.1 is seated and Audio Shield Rev D is plugged on top.
    - Confirm GPS GT-UT connections: TX->Teensy RX1(pin0), PPS->D2, VCC->3.3V, GND->GND.
-   - Confirm ESP32 WROOM connections: MISO->12, MOSI->11, SCK->13, CS->10, READY->24, RESET->25, VCC->3.3V regulator, GND->GND.
+   - Confirm ESP32 WROOM connections: MISO->12, MOSI->11, SCK->13, CS->26, READY->24, RESET->25, VCC->3.3V regulator, GND->GND.
    - RSSI divider output to `A14` and oscilloscope probe to `D3` (optional).
 
 2. Power supplies

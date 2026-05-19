@@ -1,18 +1,21 @@
-# Known Issues & Technical Debt
+# Known Issues, Technical Debt, and Status
 
-## Critical
-- **DSP State Buffer Overflow**: 
-    - `DSPProcessor.h` defines `AUDIO_BLOCK_SAMPLES` as 160.
-    - However, `_rssiState` and `_voiceState` arrays are hardcoded for 128 samples: `float _rssiState[128 + 24];`
-    - `arm_fir_init_f32` initializes with blockSize=160.
-    - **Consequence**: Memory corruption / stack overflow potential when DSP runs.
-    - **Fix**: Change `128` to `AUDIO_BLOCK_SAMPLES` in array declarations.
+## Open Issues
 
-- **Hardcoded WiFi Credentials**: `main.cpp` (Line 542) contains hardcoded credentials `("ImWatchinYou", "n0Password")`. These must be moved to `ConfigManager` before deployment.
+### Major
+- **GPS Holdover Warning Discrepancy**: 
+    - In `VoterClient.cpp` (Line 154), the serial warning logs: `"GPS Signal Lost! Entering 60s holdover mode..."`
+    - However, the disconnection logic (Line 159) triggers after a timeout of `1000ms` (1 second), immediately disconnecting the client.
+    - **Consequence**: The holdover is functionally 1 second, but log output suggests 60 seconds.
 
-## Major
-- **Unimplemented Fallback**: `VoterClient.cpp` (Line 271) notes "Fallback or Mix Mode Logic (Unimplemented)". If GPS is lost, the system sends `vtime_sec = 0`. Server behavior in this case is undefined/variable.
-
-## Minor
+### Minor
 - **Magic Numbers**: Code contains raw values for DSP coefficients and thresholds.
-- **Global Variables**: `g_headphoneVol`, etc. should be encapsulated.
+- **Global Variables**: Audio volume states and debug flags are global in `main.cpp` and should be encapsulated.
+
+---
+
+## Resolved & Closed Issues
+
+*   **DSP State Buffer Overflow** (Fixed): Mismatch in state buffer sizing resolved by declaring `_rssiState` with size `DSP_BLOCK_SAMPLES + 24` (160 + 24) in `DSPProcessor.h` to match the 160-sample block size. Circular buffer `VoiceFilter` handles voice filtering safely.
+*   **Hardcoded WiFi Credentials** (Fixed): Credentials moved to default structures in `ConfigManager.cpp` and are configurable via CLI and Web UI.
+*   **Unimplemented Fallback** (Fixed): GPS lock loss no longer streams invalid timestamps (`vtime_sec = 0`). The system enters a brief 1-second holdover and disconnects. GPS keepalive packets send standard empty location strings (`0000.00N`, `00000.00W`, `  0.0 `) during unlock, mimicking legacy PIC behavior.
