@@ -347,36 +347,36 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
   uint32_t incomingDigest = my_ntohl(header->digest);
   if (incomingDigest == _serverDigest) {
     _hasWarnedAuth = false; // Reset warning state on happy path
-    // If we get an AUTH packet, we've verified the HOST, but not our own
-    // acceptance
-    if (type == PAYLOAD_AUTH) {
-      if (_state == VOTER_DISCONNECTED) {
-        Serial.printf(
-            "[Voter] Host Password Accepted (Exp: 0x%08X Got: 0x%08X)\r\n",
-            _serverDigest, incomingDigest);
-        Serial.println("[Voter] Handshaking... Waiting for Host acceptance.");
-        _state = VOTER_AUTHENTICATING;
-      }
-    } else {
-      // Any other packet type confirms the server accepted our digest!
-      if (_state != VOTER_CONNECTED) {
-        // CRITICAL FIX: Do not auto-connect if we don't have GPS lock!
-        if (_gps && !_gps->isLocked()) {
-          return;
-        }
 
-        Serial.println("[Voter] Authentication Successful! Connected to Host.");
-        _state = VOTER_CONNECTED;
-        _authError = AUTH_ERR_NONE;
-        _authAttempts = 0; // Success!
-        _lastGPSSend = millis();
-        logger.info("VOTER", "Connected to Host %u.%u.%u.%u:%u", _hostIP[0],
-                    _hostIP[1], _hostIP[2], _hostIP[3], _hostPort);
+    if (_state == VOTER_DISCONNECTED) {
+      Serial.printf(
+          "[Voter] Host Password Accepted (Exp: 0x%08X Got: 0x%08X)\r\n",
+          _serverDigest, incomingDigest);
+      _state = VOTER_AUTHENTICATING;
+    }
+
+    // A matching digest is sufficient to be connected, regardless of
+    // payload type. The reference PIC/STM32 firmware connects on digest
+    // match alone; the server's routine "empty" heartbeat packets reuse
+    // the same payload type as the initial AUTH challenge, so requiring
+    // a non-AUTH packet here can hang forever waiting for one.
+    if (_state != VOTER_CONNECTED) {
+      // CRITICAL FIX: Do not auto-connect if we don't have GPS lock!
+      if (_gps && !_gps->isLocked()) {
+        return;
       }
 
-      if (type == PAYLOAD_ULAW) {
-        _handleProxyAudioPacket(data, len);
-      }
+      Serial.println("[Voter] Authentication Successful! Connected to Host.");
+      _state = VOTER_CONNECTED;
+      _authError = AUTH_ERR_NONE;
+      _authAttempts = 0; // Success!
+      _lastGPSSend = millis();
+      logger.info("VOTER", "Connected to Host %u.%u.%u.%u:%u", _hostIP[0],
+                  _hostIP[1], _hostIP[2], _hostIP[3], _hostPort);
+    }
+
+    if (type == PAYLOAD_ULAW) {
+      _handleProxyAudioPacket(data, len);
     }
   } else {
     // If Digest Mismatch AND it was an AUTH packet, it might be a challenge we
