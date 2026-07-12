@@ -92,14 +92,19 @@ void Logger::update() {
     
     if (targetIP == IPAddress(0, 0, 0, 0)) return;
 
-    // Send pending logs
-    while (_tail != _head) {
+    // Send at most one pending log per update() call (Phase 0 SPI reliability
+    // fix). This used to drain the entire queue in one call with a delay(50)
+    // between each entry - a burst of 3+ queued lines could block the main
+    // loop, and therefore the time-critical audio send path, for 100ms+ in
+    // a single call. Bounding to one entry keeps this call's worst case to
+    // a single SPI transaction; a backlog just drains one entry per loop
+    // iteration instead of all at once.
+    if (_tail != _head) {
         if (_buffer[_tail].pending) {
             _sendSyslog(_buffer[_tail], targetIP);
             _buffer[_tail].pending = false;
         }
         _tail = (_tail + 1) % LOG_BUFFER_SIZE;
-        if (_tail != _head) delay(50); 
     }
 }
 

@@ -79,6 +79,12 @@ VoterClient::VoterClient() {
   _burstPacketCount = 0;
   _gpSeq = 0;
   _lastHostAudioTime = 0;
+  _spiStatsWindowStart = 0;
+  _audioSendCount = 0;
+  _audioSendMaxUs = 0;
+  _audioSendTotalUs = 0;
+  _audioSendOver15msCount = 0;
+  _pendingAudioSend = false;
 }
 
 void VoterClient::begin(NetworkManager *net, GPSManager *gps, IPAddress host,
@@ -96,6 +102,9 @@ void VoterClient::begin(NetworkManager *net, GPSManager *gps, IPAddress host,
 }
 
 void VoterClient::update() {
+  // Phase 0 SPI measurement: report audio-send throughput/latency every 5s.
+  _reportSpiStats();
+
   // 1. Check Incoming
   int packetSize = _net->parsePacket();
   if (packetSize >= (int)sizeof(VOTER_PACKET_HEADER)) {
@@ -474,5 +483,55 @@ void VoterClient::processAudioFrame(uint8_t *ulawData, uint8_t rssi,
   pkt.rssi = rssi;
   memcpy(pkt.audio, ulawData, FRAME_SIZE);
 
-  _net->sendPacket((uint8_t *)&pkt, sizeof(pkt));
+  // Stage for flushPendingAudio() rather than sending here - see that
+  // method's declaration in VoterClient.h for why. Guard against the rare
+  // case where a second frame completes in the same record-queue-drain
+  // pass before the first is flushed (possible given the resample-carry
+  // remainder logic in main.cpp) - flush the older one immediately rather
+  // than silently overwriting/dropping it; that would be a real gap in
+  // the packet sequence, worse than the timing issue this is fixing.
+  if (_pendingAudioSend) {
+    flushPendingAudio();
+  }
+  _pendingAudioPkt = pkt;
+  _pendingAudioSend = true;
+}
+
+void VoterClient::flushPendingAudio() {
+  if (!_pendingAudioSend) return;
+  _pendingAudioSend = false;
+
+  uint32_t sendStart = micros();
+  _net->sendPacket((uint8_t *)&_pendingAudioPkt, sizeof(_pendingAudioPkt));
+  uint32_t sendUs = micros() - sendStart;
+
+  _audioSendCount++;
+  _audioSendTotalUs += sendUs;
+  if (sendUs > _audioSendMaxUs) _audioSendMaxUs = sendUs;
+  if (sendUs > 15000) _audioSendOver15msCount++;
+}
+
+void VoterClient::_reportSpiStats() {
+  uint32_t now = millis();
+  if (_spiStatsWindowStart == 0) {
+    _spiStatsWindowStart = now;
+    return;
+  }
+  if (now - _spiStatsWindowStart < 5000) return;
+
+  uint32_t windowMs = now - _spiStatsWindowStart;
+  float avgUs = _audioSendCount ? (float)_audioSendTotalUs / _audioSendCount : 0;
+  float achievedPps = _audioSendCount * 1000.0f / windowMs;
+
+  Serial.printf(
+      "[SPI-STATS] window=%lums sends=%lu avgPps=%.1f avgLatencyUs=%.0f "
+      "maxLatencyUs=%lu over15ms=%lu\r\n",
+      windowMs, _audioSendCount, achievedPps, avgUs, _audioSendMaxUs,
+      _audioSendOver15msCount);
+
+  _spiStatsWindowStart = now;
+  _audioSendCount = 0;
+  _audioSendMaxUs = 0;
+  _audioSendTotalUs = 0;
+  _audioSendOver15msCount = 0;
 }

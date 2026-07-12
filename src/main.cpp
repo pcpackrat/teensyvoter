@@ -1978,6 +1978,11 @@ void loop() {
     }
   }
 
+  // Send any audio frame staged by processAudioFrame() above, now that
+  // this pass's record-queue draining is done - see VoterClient.h for why
+  // this is deferred rather than sent synchronously mid-drain.
+  voterClient.flushPendingAudio();
+
   // --- Jitter Buffer Playback ---
   // Allow JitterBuffer to manage its own hysteresis (buffering state) by requesting
   // audio as long as the DMA playQueue needs it. We use 30 blocks (~87ms) as

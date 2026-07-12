@@ -36,6 +36,18 @@ public:
   // Audio Input (called by Audio ISR or polling)
   void processAudioFrame(uint8_t *ulawData, uint8_t rssi, VTIME frameTime);
 
+  // Sends the audio frame staged by processAudioFrame(), if any. Call once,
+  // after the caller's own audio-queue-draining work for this pass is done
+  // (see main.cpp) - deliberately NOT sent synchronously from within
+  // processAudioFrame() itself, because that runs inside the record-queue
+  // drain loop and the SPI-bridged send's ~700us blocking cost was
+  // perturbing that loop's own draining cadence just enough to be audible
+  // (a perfectly periodic ~50Hz artifact, since Phase 0 made this send
+  // reliable/regular for the first time - confirmed via A/B against
+  // Ethernet, which doesn't exhibit it, and isn't RF: WiFi TX power
+  // experiments didn't explain it either).
+  void flushPendingAudio();
+
   // Audio Output (TX)
   JitterBuffer
       jitterBuffer; // Public so main loop can feed it logic/read from it
@@ -99,6 +111,19 @@ private:
   bool _anchorActive;
   uint32_t _gpSeq;              // GP Sequence (+1 per non-audio packet)
   uint32_t _lastHostAudioTime; // Timestamp of last audio packet from server
+
+  // Phase 0: SPI send instrumentation (audio path only - this is the
+  // time-critical 20ms-cadence send). Logged/reset every 5s by _reportSpiStats().
+  uint32_t _spiStatsWindowStart;
+  uint32_t _audioSendCount;
+  uint32_t _audioSendMaxUs;
+  uint64_t _audioSendTotalUs;
+  uint32_t _audioSendOver15msCount;
+  void _reportSpiStats();
+
+  // Deferred audio send staging - see flushPendingAudio().
+  PROXY_AUDIO_PACKET _pendingAudioPkt;
+  bool _pendingAudioSend;
 
 public:
   uint32_t getPacketCounter() { return _packetCounter; }

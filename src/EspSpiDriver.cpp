@@ -27,52 +27,124 @@ bool EspSpiDriver::begin(uint8_t *mac) {
 }
 
 void EspSpiDriver::update() {
-  // Stub - parsePacket handles reads.
+  _pollAsyncTxn();
+  _reportRxStats();
+}
+
+void EspSpiDriver::_reportRxStats() {
+  uint32_t now = millis();
+  if (_rxStatsWindowStart == 0) {
+    _rxStatsWindowStart = now;
+    return;
+  }
+  if (now - _rxStatsWindowStart < 5000) return;
+
+  uint32_t windowMs = now - _rxStatsWindowStart;
+  float avgUs = _rxCallCount ? (float)_rxTotalUs / _rxCallCount : 0;
+  Serial.printf(
+      "[RX-STATS] window=%lums blockingCalls=%lu avgUs=%.0f totalBlockedUs=%lu\r\n",
+      windowMs, _rxCallCount, avgUs, _rxTotalUs);
+
+  _rxStatsWindowStart = now;
+  _rxCallCount = 0;
+  _rxTotalUs = 0;
 }
 
 void EspSpiDriver::sendPacket(const uint8_t *data, uint16_t len) {
   sendPacketTo(_targetIP, _targetPort, data, len);
 }
 
-void EspSpiDriver::sendPacketTo(IPAddress ip, uint16_t port, const uint8_t *data, uint16_t len) {
-  static bool isSending = false;
-  if (isSending) return; // Prevent recursive calls during SPI transactions
-  isSending = true;
-
-  // Collision evasion: Read pending data if READY is HIGH
-  if (digitalRead(_ready) == HIGH) {
-    parsePacket();
+void EspSpiDriver::_pollAsyncTxn() {
+  if (_txnInFlight == SpiTxnType::NONE) return;
+  if (_spiEvent) { // EventResponder::operator bool() - true once DMA completes
+    digitalWrite(_cs, HIGH);
+    SPI.endTransaction();
+    _spiEvent.clearEvent();
+    _txnInFlight = SpiTxnType::NONE;
   }
-  // Give the ESP32 more time to re-arm its SPI slave driver between transactions
-  delayMicroseconds(2000); 
+}
 
-  // 4MHz is the maximum stable speed for long-wire SPI slave on ESP32
-  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+void EspSpiDriver::sendPacketTo(IPAddress ip, uint16_t port, const uint8_t *data, uint16_t len) {
+  // Root cause of an audio-path buzz, found via isolated A/B testing
+  // against a proven-silent pre-Phase-0 baseline (see
+  // docs/esp32_network_migration_plan.md): it was the transfer-length
+  // right-sizing, not blocking-vs-async on either the Teensy or ESP32
+  // side, not the reduced delay, not the clock speed. Best explanation:
+  // the original full MAX_SPI_BUF transfer is mostly zero-padding after
+  // the real ~194-byte payload, so MOSI sits idle (constant) for most of
+  // the transfer while only SCLK keeps ticking. Right-sizing eliminated
+  // that idle tail, making every byte of the (shorter) transfer real,
+  // actively-toggling data - apparently higher bit-transition density
+  // despite the shorter total duration, which is what coupled audibly
+  // into the audio path. Fix: always transfer the full MAX_SPI_BUF again
+  // (restoring the zero-padding), keeping everything else that was
+  // proven innocent during the bisection: async DMA transfer (CPU freed
+  // during the ~2ms full-length transfer instead of blocked solid),
+  // 200us pad (down from the original 2000us), and 2MHz clock.
+  //
+  // If a previous async send hasn't completed yet, finish it first
+  // rather than silently dropping this one - should be rare in practice
+  // but a bounded wait beats a dropped audio frame. The 5ms safety valve
+  // aborts a stuck transaction rather than hanging the audio pipeline
+  // indefinitely.
+  uint32_t waitStart = micros();
+  while (_txnInFlight != SpiTxnType::NONE) {
+    _pollAsyncTxn();
+    if (_txnInFlight != SpiTxnType::NONE && (micros() - waitStart > 5000)) {
+      digitalWrite(_cs, HIGH);
+      SPI.endTransaction();
+      _spiEvent.clearEvent();
+      _txnInFlight = SpiTxnType::NONE;
+      break;
+    }
+  }
+
+  delayMicroseconds(200);
+
+  SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
-  delayMicroseconds(100); // More time for the ESP32 to detect the CS edge
+  delayMicroseconds(100); // Time for the ESP32 to detect the CS edge
 
-  // Buffer for the entire 512-byte transaction to use efficient block transfer
-  uint8_t buffer[MAX_SPI_BUF];
-  memset(buffer, 0, MAX_SPI_BUF);
+  memset(_txBuffer, 0, MAX_SPI_BUF);
 
   // Header: [CMD] [LEN_HI] [LEN_LO] [IP...4] [PORT...2]
-  buffer[0] = CMD_SEND_UDP;
-  buffer[1] = (len >> 8) & 0xFF;
-  buffer[2] = len & 0xFF;
-  for (int i = 0; i < 4; i++) buffer[3 + i] = ip[i];
-  buffer[7] = (port >> 8) & 0xFF;
-  buffer[8] = port & 0xFF;
+  _txBuffer[0] = CMD_SEND_UDP;
+  _txBuffer[1] = (len >> 8) & 0xFF;
+  _txBuffer[2] = len & 0xFF;
+  for (int i = 0; i < 4; i++) _txBuffer[3 + i] = ip[i];
+  _txBuffer[7] = (port >> 8) & 0xFF;
+  _txBuffer[8] = port & 0xFF;
 
   // Payload
   uint16_t payloadLen = (len > (MAX_SPI_BUF - 9)) ? (MAX_SPI_BUF - 9) : len;
-  memcpy(&buffer[9], data, payloadLen);
+  memcpy(&_txBuffer[9], data, payloadLen);
 
-  // Efficient block transfer
-  SPI.transfer(buffer, MAX_SPI_BUF);
+  // Always the full buffer now - see the note at the top of this
+  // function for why. This also means the ESP32 always gets a
+  // full-length transaction regardless of whether it had anything
+  // queued for us, so there's no truncation/data-loss risk from that
+  // angle either - but we still drain via a real parsePacket() call
+  // below when READY is high, since this async send's own RX side
+  // (_txRxScratch) is discarded/never parsed, so the bytes would
+  // otherwise never reach _rxBuffer/_handlePacket().
+  uint16_t transferLen = MAX_SPI_BUF;
 
-  digitalWrite(_cs, HIGH);
-  SPI.endTransaction();
-  isSending = false; // Reset reentrancy guard
+  if (digitalRead(_ready) == HIGH) {
+    parsePacket();
+  }
+
+  _spiEvent.clearEvent();
+  bool queued = SPI.transfer(_txBuffer, _txRxScratch, transferLen, _spiEvent);
+  if (queued) {
+    _txnInFlight = SpiTxnType::SEND;
+    // CS/endTransaction happen later in _pollAsyncTxn() once the DMA
+    // completes - do NOT close them here, the transfer is still in flight.
+  } else {
+    // Queueing failed (e.g. DMA channel busy) - fall back to closing out
+    // immediately rather than leaving CS asserted with nothing pending.
+    digitalWrite(_cs, HIGH);
+    SPI.endTransaction();
+  }
 }
 
 void EspSpiDriver::setCredentials(const char *ssid, const char *pass) {
@@ -108,7 +180,7 @@ IPAddress EspSpiDriver::resolveHostname(const char *hostname) {
   // Aggressively clear any pending data
   for (int i = 0; i < 3; i++) {
     if (digitalRead(_ready) == HIGH) {
-      parsePacket();
+      _drainOnePendingBlocking();
       delay(50);
     }
   }
@@ -215,11 +287,51 @@ IPAddress EspSpiDriver::getDNSServer() {
   return IPAddress(ip[0], ip[1], ip[2], ip[3]);
 }
 
+void EspSpiDriver::_drainOnePendingBlocking() {
+  // Kept as the shared "make sure the bus is free, then do one blocking
+  // receive" helper used by resolveHostname()/getLocalIP()'s drain loops.
+  // Just calls parsePacket() now that the receive path is synchronous
+  // again (see REVERTED note on parsePacket() below).
+  parsePacket();
+}
+
 int EspSpiDriver::parsePacket() {
+  // REVERTED (2026-07-12): tried making this async (DMA + EventResponder,
+  // same pattern as sendPacketTo(), full padded transfer length kept this
+  // time to avoid repeating the earlier auth-breaking mistake). Built and
+  // ran on real hardware, but: (a) didn't fix the audio buzz this whole
+  // investigation is chasing - unchanged, still present; (b) introduced a
+  // new regression - SPI-STATS showed entire 5-second windows with zero
+  // audio sends, not seen in any earlier test, most likely from send/
+  // receive now contending over the shared bus/CS line in a way that
+  // occasionally stalled audio entirely; (c) the [RX-STATS] avgUs number
+  // didn't even drop (~2734us average, same as the blocking version),
+  // meaning the change wasn't delivering the intended benefit either.
+  // Net negative - reverted to the simple, proven-correct blocking
+  // version below. If the receive path's blocking time needs addressing
+  // again later, do it as its own careful investigation, not bundled
+  // into the buzz chase.
+  //
+  // Wait for any in-flight async SEND (see sendPacketTo()) to finish
+  // before starting our own transaction - they share the same bus/CS
+  // line. Same bounded-wait-with-safety-valve pattern as sendPacketTo().
+  uint32_t sendWaitStart = micros();
+  while (_txnInFlight != SpiTxnType::NONE) {
+    _pollAsyncTxn();
+    if (_txnInFlight != SpiTxnType::NONE && (micros() - sendWaitStart > 5000)) {
+      digitalWrite(_cs, HIGH);
+      SPI.endTransaction();
+      _spiEvent.clearEvent();
+      _txnInFlight = SpiTxnType::NONE;
+      break;
+    }
+  }
+
   if (digitalRead(_ready) == HIGH) {
+    uint32_t rxStart = micros();
     delayMicroseconds(500);
 
-    SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+    SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
     digitalWrite(_cs, LOW);
     delayMicroseconds(50);
 
@@ -236,14 +348,15 @@ int EspSpiDriver::parsePacket() {
         }
         _cfgLen = len;
       }
-      // Pad to 512
       int consumed = 3 + (len < sizeof(_cfgBuffer) ? len : 0);
       while (consumed < MAX_SPI_BUF) {
-          SPI.transfer(0x00);
-          consumed++;
+        SPI.transfer(0x00);
+        consumed++;
       }
       digitalWrite(_cs, HIGH);
       SPI.endTransaction();
+      _rxCallCount++;
+      _rxTotalUs += (micros() - rxStart);
       return 0;
     } else if (status & STATUS_HAS_DATA) {
       uint8_t lenHi = SPI.transfer(0x00);
@@ -259,23 +372,25 @@ int EspSpiDriver::parsePacket() {
         _rxLen = 0;
       }
 
-      // Pad to 512
       int consumed = 3 + (len > 0 && len < 512 ? len : 0);
       while (consumed < MAX_SPI_BUF) {
-          SPI.transfer(0x00);
-          consumed++;
+        SPI.transfer(0x00);
+        consumed++;
       }
       digitalWrite(_cs, HIGH);
       SPI.endTransaction();
+      _rxCallCount++;
+      _rxTotalUs += (micros() - rxStart);
       return _rxLen;
     } else {
-      // Pad to 512 for idle status
       for (int k = 1; k < MAX_SPI_BUF; k++) SPI.transfer(0x00);
       _rxLen = 0;
     }
 
     digitalWrite(_cs, HIGH);
     SPI.endTransaction();
+    _rxCallCount++;
+    _rxTotalUs += (micros() - rxStart);
 
     return _rxLen;
   }
@@ -299,7 +414,7 @@ IPAddress EspSpiDriver::getLocalIP() {
 
   // Clear any pending unsolicited data before sending a command
   while (digitalRead(_ready) == HIGH) {
-    parsePacket();
+    _drainOnePendingBlocking();
     delay(5);
   }
 

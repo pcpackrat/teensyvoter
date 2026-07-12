@@ -3,6 +3,7 @@
 #include <WiFiUdp.h>
 #include <WebServer.h>
 #include "driver/spi_slave.h"
+#include "soc/gpio_struct.h" // GPIO.out_w1ts/out_w1tc register access
 #include "SpiProtocol.h"
 
 // Pin Definitions for ESP32 SPI Slave (per wiring_pin_table.csv)
@@ -75,6 +76,23 @@ volatile bool cfgCmdPending = false;
 uint8_t cfgCmdBuf[64];
 uint8_t cfgCmdLen = 0;
 
+// Phase 0: staging buffer for config commands. queueConfigCmd() used to
+// write straight into sendbuf, which was only safe because the old main
+// loop blocked on spi_slave_transmit() so nothing else ever ran while a
+// transaction was in flight. Now that transactions are queued/polled
+// non-blockingly (webServer.handleClient() etc. can run while one is
+// outstanding), sendbuf must only be touched in the single safe window
+// right after a transaction completes and before the next is queued -
+// so config commands stage here and get copied into sendbuf there.
+uint8_t cfgCmdStaged[64];
+uint8_t cfgCmdStagedLen = 0;
+volatile bool cfgCmdWantsSend = false;
+
+// Phase 0 instrumentation: transaction/forward counters, reported in the
+// 5s heartbeat alongside the existing IP/config/callback status.
+volatile uint32_t txnCompletedCount = 0;
+volatile uint32_t udpForwardedCount = 0;
+
 const char* HTML_STYLE = R"rawliteral(
 <style>
 body{font-family:Arial,sans-serif;margin:0;padding:20px;background:#2c3e50;color:#ecf0f1}
@@ -105,13 +123,9 @@ void IRAM_ATTR spi_post_setup_cb(spi_slave_transaction_t *trans) {
 
 void queueConfigCmd(uint8_t *data, uint8_t len) {
   if (len > 60) return;
-  memset(sendbuf, 0, MAX_SPI_BUF);
-  sendbuf[0] = STATUS_CONFIG_CMD;
-  sendbuf[1] = 0;
-  sendbuf[2] = len;
-  memcpy(&sendbuf[3], data, len);
-  cfgCmdPending = true;
-  GPIO.out_w1ts = (1 << GPIO_READY);
+  memcpy(cfgCmdStaged, data, len);
+  cfgCmdStagedLen = len;
+  cfgCmdWantsSend = true;
 }
 
 void sendSetParam(uint8_t paramId, const uint8_t *value, uint8_t valueLen) {
@@ -224,7 +238,30 @@ void setup() {
 
   spi_slave_initialize(RCV_HOST, &buscfg, &slvcfg, DMA_CHAN);
 
+  // Keep a transaction perpetually queued/armed instead of calling
+  // blocking spi_slave_transmit() once per loop iteration. Ruled out as
+  // an audio-buzz cause via isolated A/B testing (see
+  // docs/esp32_network_migration_plan.md) - the actual cause was transfer
+  // length right-sizing (see EspSpiDriver.cpp), not this. Restored for
+  // its real benefit: removes the gap between "finish processing the
+  // previous transaction" and "call spi_slave_transmit() again" during
+  // which the slave wasn't armed at all.
+  memset(sendbuf, 0, MAX_SPI_BUF);
+  memset(recvbuf, 0, MAX_SPI_BUF);
+  t.length = MAX_SPI_BUF * 8;
+  t.tx_buffer = sendbuf;
+  t.rx_buffer = recvbuf;
+  spi_slave_queue_trans(RCV_HOST, &t, portMAX_DELAY);
+
   WiFi.mode(WIFI_STA);
+  // Tried dropping TX power to WIFI_POWER_8_5dBm as an audio-buzz
+  // experiment (see Spirit.cpp git history / docs/esp32_network_migration_plan.md)
+  // - made the buzz LOUDER, not quieter, so reverted to stock/default
+  // power here. Likely explanation: lower power pushed the link to a
+  // worse-quality regime (more retries / slower modulation / longer
+  // airtime per packet), increasing total RF burst duration rather than
+  // reducing it. Do not re-attempt without a real link-quality read
+  // (RSSI, retry count) to confirm which direction actually helps.
   Serial.println("SPI Slave Started");
 }
 
@@ -232,8 +269,13 @@ void loop() {
   static uint32_t lastHb = 0;
   if (millis() - lastHb > 5000) {
     lastHb = millis();
-    Serial.printf("HB IP:%s Cfg:%d CBs:%u\r\n", WiFi.localIP().toString().c_str(), configReceived, cbCount);
-    
+    Serial.printf("HB IP:%s Cfg:%d CBs:%u Txns:%u UDPfwd:%u Heap:%u MinHeap:%u\r\n",
+                  WiFi.localIP().toString().c_str(), configReceived, cbCount,
+                  txnCompletedCount, udpForwardedCount, ESP.getFreeHeap(),
+                  ESP.getMinFreeHeap());
+    txnCompletedCount = 0;
+    udpForwardedCount = 0;
+
     if (WiFi.status() == WL_CONNECTED && !configReceived) {
       uint8_t req = CFG_CMD_REQUEST_CONFIG;
       queueConfigCmd(&req, 1);
@@ -255,33 +297,27 @@ void loop() {
 
   if (wasConnected) webServer.handleClient();
 
-  // SPI Transaction
-  if (!dataPending && !cfgCmdPending && wasConnected) {
-    int pktSize = udp.parsePacket();
-    if (pktSize > 0) {
-      memset(sendbuf, 0, MAX_SPI_BUF);
-      sendbuf[0] = STATUS_HAS_DATA;
-      sendbuf[1] = (pktSize >> 8) & 0xFF;
-      sendbuf[2] = (pktSize & 0xFF);
-      udp.read((uint8_t*)&sendbuf[3], (pktSize > MAX_SPI_BUF-3) ? MAX_SPI_BUF-3 : pktSize);
-      dataPending = true;
-      GPIO.out_w1ts = (1 << GPIO_READY); // READY HIGH
-    }
-  }
+  // Poll for a completed SPI transaction (non-blocking). Ruled out as an
+  // audio-buzz cause via isolated A/B testing (see
+  // docs/esp32_network_migration_plan.md) - restored for its real
+  // benefit (frees the ESP32 to service webServer/heartbeat while a
+  // transaction is outstanding instead of blocking up to 50ms). The 8-
+  // tick ceiling only bounds idle wait; a real Teensy-initiated
+  // transaction wakes this immediately regardless (FreeRTOS semaphore,
+  // not interval polling). sendbuf/recvbuf must not be touched anywhere
+  // else while a transaction is queued/in flight - queueConfigCmd()
+  // stages into a separate buffer for exactly this reason.
+  spi_slave_transaction_t *doneTrans = nullptr;
+  esp_err_t ret = spi_slave_get_trans_result(RCV_HOST, &doneTrans, pdMS_TO_TICKS(8));
 
-  memset(recvbuf, 0, MAX_SPI_BUF);
-  t.length = MAX_SPI_BUF * 8;
-  t.tx_buffer = sendbuf;
-  t.rx_buffer = recvbuf;
-  esp_err_t ret = spi_slave_transmit(RCV_HOST, &t, pdMS_TO_TICKS(50));
-  
   if (ret == ESP_OK) {
+    txnCompletedCount++;
     // Clear READY pin immediately after transaction finishes
     GPIO.out_w1tc = (1 << GPIO_READY);
     dataPending = false;
     cfgCmdPending = false;
 
-    size_t bytesTransferred = t.trans_len / 8;
+    size_t bytesTransferred = doneTrans->trans_len / 8;
       if (bytesTransferred > 0) {
         uint8_t cmd = (uint8_t)recvbuf[0];
         
@@ -292,16 +328,17 @@ void loop() {
             uint16_t payloadLen = ((uint8_t)recvbuf[1] << 8) | (uint8_t)recvbuf[2];
             IPAddress ip((uint8_t)recvbuf[3], (uint8_t)recvbuf[4], (uint8_t)recvbuf[5], (uint8_t)recvbuf[6]);
             uint16_t port = ((uint8_t)recvbuf[7] << 8) | (uint8_t)recvbuf[8];
-            
+
             // Debug non-audio packets (Syslog, etc)
             if (port != 1667) {
-              Serial.printf("[UDP] Sending Admin Packet to %s:%d (Len: %d)\r\n", 
+              Serial.printf("[UDP] Sending Admin Packet to %s:%d (Len: %d)\r\n",
                             ip.toString().c_str(), port, payloadLen);
             }
 
             udp.beginPacket(ip, port);
             udp.write((uint8_t *)&recvbuf[9], payloadLen);
             udp.endPacket();
+            udpForwardedCount++;
           }
         } else if (cmd == CMD_SET_CONFIG) {
           uint8_t ssidLen = (uint8_t)recvbuf[1];
@@ -380,5 +417,40 @@ void loop() {
           Serial.printf("[SPI] Reporting DNS: %s\r\n", dnsIP.toString().c_str());
         }
       }
+
+    // Safe window: the previous transaction is confirmed complete and the
+    // next hasn't been queued yet, so it's OK to prepare sendbuf here.
+    // Staged config commands take priority over UDP forwarding; some of
+    // the branches above (GET_IP/DNS_LOOKUP/GET_DNS) already populated
+    // sendbuf and set dataPending directly, so don't clobber those.
+    if (!dataPending && cfgCmdWantsSend) {
+      memset(sendbuf, 0, MAX_SPI_BUF);
+      sendbuf[0] = STATUS_CONFIG_CMD;
+      sendbuf[1] = 0;
+      sendbuf[2] = cfgCmdStagedLen;
+      memcpy(&sendbuf[3], cfgCmdStaged, cfgCmdStagedLen);
+      cfgCmdPending = true;
+      cfgCmdWantsSend = false;
+      GPIO.out_w1ts = (1 << GPIO_READY);
+    } else if (!dataPending && !cfgCmdPending && wasConnected) {
+      int pktSize = udp.parsePacket();
+      if (pktSize > 0) {
+        memset(sendbuf, 0, MAX_SPI_BUF);
+        sendbuf[0] = STATUS_HAS_DATA;
+        sendbuf[1] = (pktSize >> 8) & 0xFF;
+        sendbuf[2] = (pktSize & 0xFF);
+        udp.read((uint8_t*)&sendbuf[3], (pktSize > MAX_SPI_BUF-3) ? MAX_SPI_BUF-3 : pktSize);
+        dataPending = true;
+        GPIO.out_w1ts = (1 << GPIO_READY);
+      } else {
+        memset(sendbuf, 0, MAX_SPI_BUF);
+      }
+    }
+
+    memset(recvbuf, 0, MAX_SPI_BUF);
+    t.length = MAX_SPI_BUF * 8;
+    t.tx_buffer = sendbuf;
+    t.rx_buffer = recvbuf;
+    spi_slave_queue_trans(RCV_HOST, &t, portMAX_DELAY);
   }
 }
