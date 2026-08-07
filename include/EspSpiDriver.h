@@ -137,6 +137,28 @@ private:
   uint32_t _asyncRxQueueDroppedCount = 0;
   void _handleAsyncRxScratch();
 
+  // Downlink payload checksum - the CMD_SEND_UDP uplink direction already
+  // has one (see sendPacketTo()); this is the same idea for the other
+  // direction, since a corrupted-challenge-field report on received
+  // packets could originate on either the SPI leg or further upstream
+  // (ESP32<->voter server over the real network), and nothing was
+  // distinguishing between them. Verified in both places STATUS_HAS_DATA
+  // downlink payloads get read: parsePacket()'s live poll and
+  // _handleAsyncRxScratch()'s recovered-from-async-response path.
+  uint32_t _downlinkCksumMismatchCount = 0;
+
+  // Downlink transport sequence - mirrors _txSeq on the uplink leg (see
+  // sendPacketTo()), but for tracking loss instead of corruption: the
+  // checksum above only catches packets that arrive corrupted, not
+  // packets that never arrive at all. Added specifically to check whether
+  // the Voter auth handshake needing several retries (even when uplink
+  // metrics look completely clean) is caused by the server's challenge/
+  // accept response getting lost on this leg.
+  uint16_t _lastDownlinkSeq = 0;
+  bool _downlinkSeqInit = false;
+  uint32_t _downlinkSeqDropCount = 0;
+  void _checkDownlinkSeq(uint16_t seq);
+
   // resolveHostname()/getLocalIP() loop on digitalRead(_ready) to drain
   // stale pending data before issuing a fresh request via parsePacket().
   void _drainOnePendingBlocking();

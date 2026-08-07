@@ -57,19 +57,40 @@ void EspSpiDriver::_pollAsyncTxn() {
   static uint32_t lastAsyncRxReport = 0;
   static uint32_t lastReportedRecovered = 0;
   static uint32_t lastReportedDropped = 0;
+  static uint32_t lastReportedCksumBad = 0;
   if (millis() - lastAsyncRxReport > 5000) {
     lastAsyncRxReport = millis();
-    // Both counters are cumulative-since-boot (never reset), so gating
-    // purely on ">0" reprinted the same totals every 5s forever after the
-    // first ever recovery - only print when something actually changed
-    // since the last report.
-    if (_asyncRxRecoveredCount != lastReportedRecovered || _asyncRxQueueDroppedCount != lastReportedDropped) {
-      Serial.printf("[SPI-RX] Async-recovered downlink packets: %lu total (%lu dropped due to queue full)\r\n",
-                    (unsigned long)_asyncRxRecoveredCount, (unsigned long)_asyncRxQueueDroppedCount);
+    // All three counters are cumulative-since-boot (never reset), so
+    // gating purely on ">0" reprinted the same totals every 5s forever
+    // after the first ever event - only print when something changed.
+    if (_asyncRxRecoveredCount != lastReportedRecovered ||
+        _asyncRxQueueDroppedCount != lastReportedDropped ||
+        _downlinkCksumMismatchCount != lastReportedCksumBad) {
+      Serial.printf("[SPI-RX] Async-recovered downlink packets: %lu total (%lu dropped due to queue full, %lu checksum-bad)\r\n",
+                    (unsigned long)_asyncRxRecoveredCount, (unsigned long)_asyncRxQueueDroppedCount,
+                    (unsigned long)_downlinkCksumMismatchCount);
       lastReportedRecovered = _asyncRxRecoveredCount;
       lastReportedDropped = _asyncRxQueueDroppedCount;
+      lastReportedCksumBad = _downlinkCksumMismatchCount;
     }
   }
+}
+
+// See _lastDownlinkSeq's declaration comment. Called from both places a
+// downlink STATUS_HAS_DATA payload gets read (parsePacket()'s live poll,
+// _handleAsyncRxScratch()'s recovered path) - loss can happen via either.
+void EspSpiDriver::_checkDownlinkSeq(uint16_t seq) {
+  if (_downlinkSeqInit) {
+    uint16_t expected = (uint16_t)(_lastDownlinkSeq + 1);
+    if (seq != expected) {
+      uint16_t gap = (uint16_t)(seq - expected);
+      _downlinkSeqDropCount += gap;
+      Serial.printf("[SEQ] Gap in ESP32->Teensy SPI downlink: expected %u got %u (missing %u, total missing %lu)\r\n",
+                    expected, seq, gap, (unsigned long)_downlinkSeqDropCount);
+    }
+  }
+  _lastDownlinkSeq = seq;
+  _downlinkSeqInit = true;
 }
 
 // Parses a completed async send's response side (_txRxScratch) exactly
@@ -85,11 +106,21 @@ void EspSpiDriver::_handleAsyncRxScratch() {
       _queueRxConfigCmd(&_txRxScratch[3], len);
     }
   } else if (status & STATUS_HAS_DATA) {
-    if (len > 0 && len < 512 && (3 + len) <= MAX_SPI_BUF) {
+    // [3][4] = CKSUM, [5][6] = SEQ, payload from [7] - matches the ESP32's
+    // downlink poll staging format (see Spirit.cpp's "safe window" handler).
+    uint16_t recvCksum = ((uint16_t)_txRxScratch[3] << 8) | _txRxScratch[4];
+    uint16_t recvSeq = ((uint16_t)_txRxScratch[5] << 8) | _txRxScratch[6];
+    if (len > 0 && len < 512 && (7 + len) <= MAX_SPI_BUF) {
+      _checkDownlinkSeq(recvSeq);
+      uint16_t calcCksum = 0;
+      for (uint16_t i = 0; i < len; i++) calcCksum += _txRxScratch[7 + i];
+      if (calcCksum != recvCksum) {
+        _downlinkCksumMismatchCount++;
+      }
       if (_asyncRxQueueCount >= ASYNC_RX_QUEUE_SIZE) {
         _asyncRxQueueDroppedCount++;
       } else {
-        memcpy(_asyncRxQueue[_asyncRxQueueTail], &_txRxScratch[3], len);
+        memcpy(_asyncRxQueue[_asyncRxQueueTail], &_txRxScratch[7], len);
         _asyncRxQueueLen[_asyncRxQueueTail] = len;
         _asyncRxQueueTail = (_asyncRxQueueTail + 1) % ASYNC_RX_QUEUE_SIZE;
         _asyncRxQueueCount++;
@@ -432,7 +463,13 @@ int EspSpiDriver::parsePacket() {
   }
 
   if (digitalRead(_ready) == HIGH) {
-    delayMicroseconds(500);
+    // Was 500us - barely above the observed ESP32 re-arm ceiling
+    // (MaxRearmUs, up to ~455-464us on hardware), same insufficient-
+    // margin situation sendPacketTo()'s original 200us pad was in before
+    // it got bumped to 600us. That fix (plus the READY-timing fix on the
+    // ESP32 side) cut downlink loss from ~36% to ~15% but didn't finish
+    // the job - this is the second half, matching the same pattern.
+    delayMicroseconds(700);
 
     SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
     digitalWrite(_cs, LOW);
@@ -465,17 +502,29 @@ int EspSpiDriver::parsePacket() {
       uint8_t lenHi = SPI.transfer(0x00);
       uint8_t lenLo = SPI.transfer(0x00);
       uint16_t len = (lenHi << 8) | lenLo;
+      uint8_t cksumHi = SPI.transfer(0x00);
+      uint8_t cksumLo = SPI.transfer(0x00);
+      uint16_t recvCksum = (cksumHi << 8) | cksumLo;
+      uint8_t seqHi = SPI.transfer(0x00);
+      uint8_t seqLo = SPI.transfer(0x00);
+      uint16_t recvSeq = (seqHi << 8) | seqLo;
 
       if (len > 0 && len < 512) {
+        _checkDownlinkSeq(recvSeq);
+        uint16_t calcCksum = 0;
         for (int i = 0; i < len; i++) {
           _rxBuffer[i] = SPI.transfer(0x00);
+          calcCksum += _rxBuffer[i];
         }
         _rxLen = len;
+        if (calcCksum != recvCksum) {
+          _downlinkCksumMismatchCount++;
+        }
       } else {
         _rxLen = 0;
       }
 
-      int consumed = 3 + (len > 0 && len < 512 ? len : 0);
+      int consumed = 7 + (len > 0 && len < 512 ? len : 0);
       while (consumed < MAX_SPI_BUF) {
         SPI.transfer(0x00);
         consumed++;

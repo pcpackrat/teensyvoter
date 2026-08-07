@@ -192,6 +192,17 @@ IPAddress udpSendStagingIP;
 uint16_t udpSendStagingPort = 0;
 bool udpSendPending = false;
 
+// Downlink transport sequence - mirrors _txSeq/[SEQ] Gap on the uplink
+// leg, but for ESP32->Teensy. The downlink checksum (added the same
+// night) only catches corruption in packets that arrive; it says nothing
+// about packets that never arrive at all, which is exactly what would
+// explain the Voter auth handshake needing several retries even when the
+// uplink side looks completely clean - the request could be reaching the
+// server fine while the response gets lost on this leg. Free-running,
+// increments on every real UDP packet staged for the Teensy, independent
+// of the Voter protocol payload itself.
+uint16_t downlinkSeq = 0;
+
 // ETH is always preferred; WiFi is only started as a fallback, using
 // credentials that arrive with the rest of the config (see CMD_PUSH_CONFIG
 // below - ETH bring-up itself is deliberately delayed until config
@@ -1068,11 +1079,6 @@ void loop() {
     bool seqGapPending = false;
     uint16_t seqGapExpected = 0, seqGapGot = 0, seqGapMissing = 0;
     const char *seqGapType = "";
-    // Set after a CMD_SEND_UDP uplink send below - gates the downlink poll
-    // further down so the two don't stack into the same pass. See that
-    // gate's comment for why.
-    bool justSentUplink = false;
-
     size_t bytesTransferred = doneTrans->trans_len / 8;
       if (bytesTransferred > 0) {
         uint8_t cmd = (uint8_t)rb[0];
@@ -1190,7 +1196,6 @@ void loop() {
                             ip.toString().c_str(), port, payloadLen);
             }
             udpForwardedCount++;
-            justSentUplink = true;
           }
         } else if (cmd == CMD_GET_IP) {
           memset(sb, 0, MAX_SPI_BUF);
@@ -1203,7 +1208,13 @@ void loop() {
           sb[5] = myIP[2];
           sb[6] = myIP[3];
           dataPending = true;
-          GPIO.out_w1ts = (1 << GPIO_READY);
+          // READY is raised by spi_post_setup_cb once this pass's
+          // spi_slave_queue_trans() actually arms the slave with sb's new
+          // content - NOT here. Asserting it this early (checked by the
+          // Teensy's digitalRead(_ready)) gave a false "go ahead and
+          // read" signal before the transaction was really armed,
+          // sometimes losing the very transfer READY promised. Same fix
+          // applied to every branch that sets dataPending/cfgCmdPending.
           Serial.printf("[SPI] Reporting Local IP: %s\r\n", myIP.toString().c_str());
         } else if (cmd == CMD_PUSH_CONFIG) {
           uint16_t cfgLen = ((uint8_t)rb[1] << 8) | (uint8_t)rb[2];
@@ -1242,7 +1253,8 @@ void loop() {
               Serial.printf("[DNS] Failed to resolve %s\r\n", hostname);
             }
             dataPending = true;
-            GPIO.out_w1ts = (1 << GPIO_READY);
+            // See the CMD_GET_IP branch's comment - READY is raised by
+            // spi_post_setup_cb at actual arm-time, not here.
           }
         } else if (cmd == CMD_GET_DNS) {
           memset(sb, 0, MAX_SPI_BUF);
@@ -1255,7 +1267,8 @@ void loop() {
           sb[5] = dnsIP[2];
           sb[6] = dnsIP[3];
           dataPending = true;
-          GPIO.out_w1ts = (1 << GPIO_READY);
+          // See the CMD_GET_IP branch's comment - READY is raised by
+          // spi_post_setup_cb at actual arm-time, not here.
           Serial.printf("[SPI] Reporting DNS: %s\r\n", dnsIP.toString().c_str());
         } else {
           // cmd byte didn't match any known command - a transaction that
@@ -1279,25 +1292,30 @@ void loop() {
       cfgCmdQueueHead = (cfgCmdQueueHead + 1) % CFG_CMD_QUEUE_SIZE;
       cfgCmdQueueCount--;
       cfgCmdPending = true;
-      GPIO.out_w1ts = (1 << GPIO_READY);
-    } else if (!dataPending && !cfgCmdPending && !justSentUplink && wasConnected &&
+      // See the CMD_GET_IP branch's comment - READY is raised by
+      // spi_post_setup_cb at actual arm-time, not here.
+    } else if (!dataPending && !cfgCmdPending && wasConnected &&
                (netMode == NetMode::ETH_ACTIVE || netMode == NetMode::WIFI_ACTIVE)) {
       // Same netMode guard as the CMD_SEND_UDP path above - don't touch the
       // socket while the netif is mid-teardown/mid-bringup. (NET_SETTLE_MS
       // reverted 2026-08-07, see the wasConnected block's comment.)
       //
-      // !justSentUplink: don't also poll for downlink data in the same
-      // pass that just handled an uplink send. Every CMD_SEND_UDP
-      // transaction was stacking a udp.beginPacket/write/endPacket() AND
-      // a udp.parsePacket() into the same processing window - individually
-      // both were fast enough to never trip the 5ms alarm on either one,
-      // but paying that combined cost on literally every audio transaction
-      // (not occasionally) is what was widening the SPI re-arm window
-      // enough to lose frames constantly. Bench-confirmed via the
-      // transport sequence numbers: ~47% loss during sustained audio
-      // before this fix. Skipping the poll here just defers it to the
-      // next transaction, which arrives within ~20ms during active audio
-      // anyway - negligible for downlink timing.
+      // !justSentUplink REMOVED (2026-08-07) - it originally existed
+      // because every CMD_SEND_UDP transaction was ALSO doing the actual
+      // udp.beginPacket/write/endPacket() relay send inline, right here,
+      // stacking two socket operations into the same pre-rearm window
+      // (~47% loss before that fix). That send has since been deferred to
+      // run AFTER spi_slave_queue_trans() re-arms (see the deferred-send
+      // block below), so the expensive part this gate was protecting
+      // against no longer runs in this window at all - only the cheap,
+      // already-alarmed (5ms, never fired) udp.parsePacket()/udp.read()
+      // pair remains, and skipping it every single time an uplink send
+      // also happened was starving the downlink poll of most of its
+      // opportunities during sustained 50pps audio (bench-confirmed:
+      // ~15-27% downlink loss even after fixing two other real downlink
+      // bugs). Letting it run on every eligible pass instead of only the
+      // gaps between uplink sends should give it far more chances to keep
+      // up with real downlink traffic volume.
       uint32_t udpParseStartUs = micros();
       int pktSize = udp.parsePacket();
       uint32_t udpParseDurUs = micros() - udpParseStartUs;
@@ -1309,9 +1327,27 @@ void loop() {
         sb[0] = STATUS_HAS_DATA;
         sb[1] = (pktSize >> 8) & 0xFF;
         sb[2] = (pktSize & 0xFF);
-        udp.read((uint8_t*)&sb[3], (pktSize > MAX_SPI_BUF-3) ? MAX_SPI_BUF-3 : pktSize);
+        // [CKSUM_HI][CKSUM_LO] at [3][4], [SEQ_HI][SEQ_LO] at [5][6],
+        // payload from [7] - downlink counterpart to the CMD_SEND_UDP
+        // uplink checksum+seq (see that handler above). Only this
+        // audio-relay poll gets the extra fields - GET_IP/DNS_LOOKUP/
+        // GET_DNS keep their existing 3-byte header via
+        // _readResponseFrame() on the Teensy side, untouched.
+        uint16_t readLen = (pktSize > (int)(MAX_SPI_BUF - 7)) ? (MAX_SPI_BUF - 7) : pktSize;
+        udp.read((uint8_t*)&sb[7], readLen);
+        uint16_t cksum = 0;
+        for (uint16_t i = 0; i < readLen; i++) cksum += (uint8_t)sb[7 + i];
+        sb[3] = (cksum >> 8) & 0xFF;
+        sb[4] = cksum & 0xFF;
+        sb[5] = (downlinkSeq >> 8) & 0xFF;
+        sb[6] = downlinkSeq & 0xFF;
+        downlinkSeq++;
         dataPending = true;
-        GPIO.out_w1ts = (1 << GPIO_READY);
+        // See the CMD_GET_IP branch's comment (setup()/loop() area above)
+        // - READY is raised by spi_post_setup_cb once spi_slave_queue_trans()
+        // below actually arms the slave with this data, not here. This is
+        // the hot path (50pps) most likely to matter for the downlink
+        // [SEQ] Gap loss this fix targets.
       } else {
         memset(sb, 0, MAX_SPI_BUF);
       }
