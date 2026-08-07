@@ -6,14 +6,22 @@ EspSpiDriver::EspSpiDriver(uint8_t csPin, uint8_t readyPin, uint8_t resetPin) {
   _ready = readyPin;
   _reset = resetPin;
   _rxLen = 0;
-  _cfgLen = 0;
   _cachedIP = IPAddress(0, 0, 0, 0);
   _staticDNS = IPAddress(0, 0, 0, 0);
 }
 
-bool EspSpiDriver::begin(uint8_t *mac) {
+bool EspSpiDriver::begin() {
   pinMode(_cs, OUTPUT);
   digitalWrite(_cs, HIGH);
+
+  // Must configure the hardware SPI pins (drives SCK to a known idle-low
+  // state) before releasing the ESP32 from reset below. SCK (Teensy pin
+  // 13) drives the ESP32's IO12, which is a boot strapping pin
+  // (VDD_SDIO flash voltage select) - if it's left floating at the
+  // reset edge it can be sampled high, selecting the wrong flash
+  // voltage and causing an intermittent boot failure. Reproduced on
+  // hardware: boot success depended on power-up timing before this fix.
+  SPI.begin();
 
   pinMode(_reset, OUTPUT);
   digitalWrite(_reset, LOW);
@@ -22,32 +30,11 @@ bool EspSpiDriver::begin(uint8_t *mac) {
 
   pinMode(_ready, INPUT);
 
-  SPI.begin();
   return true;
 }
 
 void EspSpiDriver::update() {
   _pollAsyncTxn();
-  _reportRxStats();
-}
-
-void EspSpiDriver::_reportRxStats() {
-  uint32_t now = millis();
-  if (_rxStatsWindowStart == 0) {
-    _rxStatsWindowStart = now;
-    return;
-  }
-  if (now - _rxStatsWindowStart < 5000) return;
-
-  uint32_t windowMs = now - _rxStatsWindowStart;
-  float avgUs = _rxCallCount ? (float)_rxTotalUs / _rxCallCount : 0;
-  Serial.printf(
-      "[RX-STATS] window=%lums blockingCalls=%lu avgUs=%.0f totalBlockedUs=%lu\r\n",
-      windowMs, _rxCallCount, avgUs, _rxTotalUs);
-
-  _rxStatsWindowStart = now;
-  _rxCallCount = 0;
-  _rxTotalUs = 0;
 }
 
 void EspSpiDriver::sendPacket(const uint8_t *data, uint16_t len) {
@@ -57,10 +44,58 @@ void EspSpiDriver::sendPacket(const uint8_t *data, uint16_t len) {
 void EspSpiDriver::_pollAsyncTxn() {
   if (_txnInFlight == SpiTxnType::NONE) return;
   if (_spiEvent) { // EventResponder::operator bool() - true once DMA completes
+    // _txRxScratch now holds this transaction's full response - inspect it
+    // before closing out, instead of discarding it. See the queue's
+    // declaration comment in EspSpiDriver.h for why this matters.
+    _handleAsyncRxScratch();
     digitalWrite(_cs, HIGH);
     SPI.endTransaction();
     _spiEvent.clearEvent();
     _txnInFlight = SpiTxnType::NONE;
+  }
+
+  static uint32_t lastAsyncRxReport = 0;
+  static uint32_t lastReportedRecovered = 0;
+  static uint32_t lastReportedDropped = 0;
+  if (millis() - lastAsyncRxReport > 5000) {
+    lastAsyncRxReport = millis();
+    // Both counters are cumulative-since-boot (never reset), so gating
+    // purely on ">0" reprinted the same totals every 5s forever after the
+    // first ever recovery - only print when something actually changed
+    // since the last report.
+    if (_asyncRxRecoveredCount != lastReportedRecovered || _asyncRxQueueDroppedCount != lastReportedDropped) {
+      Serial.printf("[SPI-RX] Async-recovered downlink packets: %lu total (%lu dropped due to queue full)\r\n",
+                    (unsigned long)_asyncRxRecoveredCount, (unsigned long)_asyncRxQueueDroppedCount);
+      lastReportedRecovered = _asyncRxRecoveredCount;
+      lastReportedDropped = _asyncRxQueueDroppedCount;
+    }
+  }
+}
+
+// Parses a completed async send's response side (_txRxScratch) exactly
+// like parsePacket()'s live-read branches do, but operating on the
+// already-fully-received in-memory buffer instead of doing fresh
+// SPI.transfer(0x00) calls - the DMA already clocked the whole thing in.
+void EspSpiDriver::_handleAsyncRxScratch() {
+  uint8_t status = _txRxScratch[0];
+  uint16_t len = ((uint16_t)_txRxScratch[1] << 8) | _txRxScratch[2];
+
+  if (status == STATUS_CONFIG_CMD) {
+    if (len > 0 && len < sizeof(_cfgQueue[0]) && (3 + len) <= MAX_SPI_BUF) {
+      _queueRxConfigCmd(&_txRxScratch[3], len);
+    }
+  } else if (status & STATUS_HAS_DATA) {
+    if (len > 0 && len < 512 && (3 + len) <= MAX_SPI_BUF) {
+      if (_asyncRxQueueCount >= ASYNC_RX_QUEUE_SIZE) {
+        _asyncRxQueueDroppedCount++;
+      } else {
+        memcpy(_asyncRxQueue[_asyncRxQueueTail], &_txRxScratch[3], len);
+        _asyncRxQueueLen[_asyncRxQueueTail] = len;
+        _asyncRxQueueTail = (_asyncRxQueueTail + 1) % ASYNC_RX_QUEUE_SIZE;
+        _asyncRxQueueCount++;
+        _asyncRxRecoveredCount++;
+      }
+    }
   }
 }
 
@@ -91,6 +126,15 @@ void EspSpiDriver::sendPacketTo(IPAddress ip, uint16_t port, const uint8_t *data
   while (_txnInFlight != SpiTxnType::NONE) {
     _pollAsyncTxn();
     if (_txnInFlight != SpiTxnType::NONE && (micros() - waitStart > 5000)) {
+      // Forced abort of a still-in-flight transfer - previously silent.
+      // The prior transaction's DMA data may not have been fully clocked
+      // out to the ESP32 when we yank CS high here, so this is a real,
+      // if rare, potential frame corruption/loss point right at the
+      // Teensy->ESP32 boundary. Counting it so it's visible instead of
+      // invisible when chasing dropped/choppy audio.
+      _forcedAbortCount++;
+      Serial.printf("[SPI-TX] Forced abort of stuck async send (#%lu so far)\r\n",
+                    (unsigned long)_forcedAbortCount);
       digitalWrite(_cs, HIGH);
       SPI.endTransaction();
       _spiEvent.clearEvent();
@@ -99,7 +143,29 @@ void EspSpiDriver::sendPacketTo(IPAddress ip, uint16_t port, const uint8_t *data
     }
   }
 
-  delayMicroseconds(200);
+  // Drain any pending downlink data BEFORE opening our own transaction
+  // below - parsePacket() runs a fully self-contained beginTransaction()/
+  // CS-low/.../CS-high/endTransaction() cycle of its own. Calling it after
+  // our CS was already asserted (as this used to do, checked further
+  // down) left CS high (parsePacket()'s own closing edge) with nothing
+  // re-asserting it before the async SPI.transfer() below - that transfer
+  // then ran with CS deasserted, invisible to the ESP32 slave, a silent
+  // single-frame loss. Confirmed as the source of residual isolated
+  // "missing 1" SPI sequence gaps that persisted after the re-arm-window
+  // fixes (which addressed a different, ESP32-side loss mechanism).
+  if (digitalRead(_ready) == HIGH) {
+    parsePacket();
+  }
+
+  // Pad before reasserting CS - must clear the ESP32 slave's measured
+  // dequeue-process-requeue re-arm window (MaxRearmUs in the ESP32 HB log,
+  // observed up to ~427us on hardware) or this transaction starts before
+  // the slave is listening again and is silently lost. Was 200us here -
+  // less than the observed ceiling - while parsePacket()'s equivalent pad
+  // below was already 500us; that asymmetry matched the evidence exactly
+  // (SPI seq gaps were overwhelmingly on the send side). 600us keeps
+  // margin above the measured max.
+  delayMicroseconds(600);
 
   SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
@@ -107,31 +173,46 @@ void EspSpiDriver::sendPacketTo(IPAddress ip, uint16_t port, const uint8_t *data
 
   memset(_txBuffer, 0, MAX_SPI_BUF);
 
-  // Header: [CMD] [LEN_HI] [LEN_LO] [IP...4] [PORT...2]
+  // Header: [CMD] [SEQ_HI] [SEQ_LO] [LEN_HI] [LEN_LO] [IP...4] [PORT...2] [CKSUM_HI] [CKSUM_LO]
+  // SEQ is a free-running per-transaction counter, purely at this SPI
+  // transport layer (independent of anything inside the Voter protocol
+  // payload) - lets the ESP32 directly detect a dropped transaction on
+  // this leg (a gap in SEQ) instead of only ever inferring loss/
+  // corruption indirectly from app-layer symptoms like the challenge-
+  // field validity check. SEQ alone only proves a transaction arrived,
+  // not that its content is intact - added CKSUM (simple 16-bit additive
+  // sum over the payload) after two rounds of transport fixes still left
+  // reports of corrupted-sounding transmitted audio at the server with
+  // clean SEQ/loss numbers throughout, which pointed at exactly this
+  // blind spot: bit errors within a frame that don't happen to land on
+  // the SEQ bytes are completely invisible to a sequence-only check.
   _txBuffer[0] = CMD_SEND_UDP;
-  _txBuffer[1] = (len >> 8) & 0xFF;
-  _txBuffer[2] = len & 0xFF;
-  for (int i = 0; i < 4; i++) _txBuffer[3 + i] = ip[i];
-  _txBuffer[7] = (port >> 8) & 0xFF;
-  _txBuffer[8] = port & 0xFF;
+  _txBuffer[1] = (_txSeq >> 8) & 0xFF;
+  _txBuffer[2] = _txSeq & 0xFF;
+  _txSeq++;
+  _txBuffer[3] = (len >> 8) & 0xFF;
+  _txBuffer[4] = len & 0xFF;
+  for (int i = 0; i < 4; i++) _txBuffer[5 + i] = ip[i];
+  _txBuffer[9] = (port >> 8) & 0xFF;
+  _txBuffer[10] = port & 0xFF;
 
   // Payload
-  uint16_t payloadLen = (len > (MAX_SPI_BUF - 9)) ? (MAX_SPI_BUF - 9) : len;
-  memcpy(&_txBuffer[9], data, payloadLen);
+  uint16_t payloadLen = (len > (MAX_SPI_BUF - 13)) ? (MAX_SPI_BUF - 13) : len;
+  uint16_t cksum = 0;
+  for (uint16_t i = 0; i < payloadLen; i++) cksum += data[i];
+  _txBuffer[11] = (cksum >> 8) & 0xFF;
+  _txBuffer[12] = cksum & 0xFF;
+  memcpy(&_txBuffer[13], data, payloadLen);
 
   // Always the full buffer now - see the note at the top of this
   // function for why. This also means the ESP32 always gets a
   // full-length transaction regardless of whether it had anything
   // queued for us, so there's no truncation/data-loss risk from that
   // angle either - but we still drain via a real parsePacket() call
-  // below when READY is high, since this async send's own RX side
-  // (_txRxScratch) is discarded/never parsed, so the bytes would
-  // otherwise never reach _rxBuffer/_handlePacket().
+  // above (before our own CS assertion) when READY is high, since this
+  // async send's own RX side (_txRxScratch) is discarded/never parsed, so
+  // the bytes would otherwise never reach _rxBuffer/_handlePacket().
   uint16_t transferLen = MAX_SPI_BUF;
-
-  if (digitalRead(_ready) == HIGH) {
-    parsePacket();
-  }
 
   _spiEvent.clearEvent();
   bool queued = SPI.transfer(_txBuffer, _txRxScratch, transferLen, _spiEvent);
@@ -147,30 +228,61 @@ void EspSpiDriver::sendPacketTo(IPAddress ip, uint16_t port, const uint8_t *data
   }
 }
 
-void EspSpiDriver::setCredentials(const char *ssid, const char *pass) {
-  uint8_t ssidLen = strlen(ssid);
-  uint8_t passLen = strlen(pass);
+// Appends a received config command to the RX queue (FIFO, drained by
+// readConfigCmd()). See the queue's declaration comment in EspSpiDriver.h
+// for why this needs to be a real queue and not a single slot.
+void EspSpiDriver::_queueRxConfigCmd(const uint8_t *data, uint16_t len) {
+  if (len == 0 || len >= sizeof(_cfgQueue[0])) return;
+  if (_cfgQueueCount >= CFG_RX_QUEUE_SIZE) {
+    Serial.println("[CFG-RX] Queue full, dropping incoming config command!");
+    return;
+  }
+  memcpy(_cfgQueue[_cfgQueueTail], data, len);
+  _cfgQueueLen[_cfgQueueTail] = len;
+  _cfgQueueTail = (_cfgQueueTail + 1) % CFG_RX_QUEUE_SIZE;
+  _cfgQueueCount++;
+}
 
-  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(_cs, LOW);
-  delayMicroseconds(50);
+// Reads a "status + 2-byte len [+ payload]" response frame from an
+// already-open transaction (CS already low) and pads the rest out to
+// MAX_SPI_BUF. Routes a STATUS_CONFIG_CMD response into the RX queue -
+// every response-reading site needs this, not just parsePacket(), or a
+// queued config command that happens to land in the same transaction as
+// (say) a getLocalIP() poll gets silently discarded instead of ever
+// reaching hasConfigCmd()/readConfigCmd(). Confirmed on hardware: a
+// WiFi SSID change made through the AP setup page was lost this way -
+// getLocalIP() is polled every 5s by the Teensy's own reconnect-check
+// loop, and one of those polls ate the queued PARAM_WIFI_SSID command
+// instead of the config-dispatch path ever seeing it.
+//
+// outBuf/maxOutLen are for a STATUS_HAS_DATA payload (e.g. a 4-byte IP);
+// pass maxOutLen=0 if the caller doesn't expect one. Returns the raw
+// status byte; *outLen is set to the STATUS_HAS_DATA payload length (0
+// if none, or if it was a config command instead).
+uint8_t EspSpiDriver::_readResponseFrame(uint8_t *outBuf, uint8_t maxOutLen, uint16_t *outLen) {
+  uint8_t status = SPI.transfer(0x00);
+  uint8_t lenHi = SPI.transfer(0x00);
+  uint8_t lenLo = SPI.transfer(0x00);
+  uint16_t len = (lenHi << 8) | lenLo;
+  int consumed = 3;
+  *outLen = 0;
 
-  SPI.transfer(CMD_SET_CONFIG);
-  SPI.transfer(ssidLen);
-  for (int i = 0; i < ssidLen; i++) SPI.transfer(ssid[i]);
-  
-  SPI.transfer(passLen);
-  for (int i = 0; i < passLen; i++) SPI.transfer(pass[i]);
-
-  // Pad to 512
-  int sent = 3 + ssidLen + passLen;
-  while (sent < MAX_SPI_BUF) {
-    SPI.transfer(0x00);
-    sent++;
+  if (status == STATUS_CONFIG_CMD && len > 0 && len < sizeof(_cfgQueue[0])) {
+    uint8_t cmdBuf[256];
+    for (int i = 0; i < len; i++) cmdBuf[i] = SPI.transfer(0x00);
+    _queueRxConfigCmd(cmdBuf, len);
+    consumed += len;
+  } else if ((status & STATUS_HAS_DATA) && len > 0 && len <= maxOutLen) {
+    for (int i = 0; i < len; i++) outBuf[i] = SPI.transfer(0x00);
+    *outLen = len;
+    consumed += len;
   }
 
-  digitalWrite(_cs, HIGH);
-  SPI.endTransaction();
+  while (consumed < MAX_SPI_BUF) {
+    SPI.transfer(0x00);
+    consumed++;
+  }
+  return status;
 }
 
 IPAddress EspSpiDriver::resolveHostname(const char *hostname) {
@@ -210,42 +322,27 @@ IPAddress EspSpiDriver::resolveHostname(const char *hostname) {
       digitalWrite(_cs, LOW);
       delayMicroseconds(50);
 
-      uint8_t status = SPI.transfer(0x00);
-      uint8_t lenHi  = SPI.transfer(0x00);
-      uint8_t lenLo  = SPI.transfer(0x00);
-      uint16_t len   = (lenHi << 8) | lenLo;
-
       uint8_t ip[4] = {0, 0, 0, 0};
-      if ((status & STATUS_HAS_DATA) && len == 4) {
-        for (int i = 0; i < 4; i++) ip[i] = SPI.transfer(0x00);
-      }
-
-      // Finish the 512 byte transfer
-      int consumed = 3 + ((status & STATUS_HAS_DATA) ? 4 : 0);
-      while (consumed < MAX_SPI_BUF) {
-          SPI.transfer(0x00);
-          consumed++;
-      }
+      uint16_t len = 0;
+      uint8_t status = _readResponseFrame(ip, sizeof(ip), &len);
 
       digitalWrite(_cs, HIGH);
       SPI.endTransaction();
-      
-      if (status & STATUS_HAS_DATA) {
-        if (len == 4) {
-          IPAddress result(ip[0], ip[1], ip[2], ip[3]);
-          Serial.printf("[DNS] SPI RX: %d.%d.%d.%d (Status: 0x%02X, Len: %d)\r\n", 
-                        ip[0], ip[1], ip[2], ip[3], status, len);
-          
-          // CRITICAL: If the result matches our local IP, it's almost certainly stale data
-          // from a previous getLocalIP() call that was still in the ESP32's buffer.
-          if (result != IPAddress(0,0,0,0) && result != _cachedIP) {
-            return result;
-          } else if (result == _cachedIP) {
-            Serial.println("[DNS] Ignoring stale Local IP in SPI buffer, waiting for real result...");
-          }
-        } else {
-          Serial.printf("[DNS] SPI RX Other: Status 0x%02X, Len %d\r\n", status, len);
+
+      if (len == 4) {
+        IPAddress result(ip[0], ip[1], ip[2], ip[3]);
+        Serial.printf("[DNS] SPI RX: %d.%d.%d.%d (Status: 0x%02X, Len: %d)\r\n",
+                      ip[0], ip[1], ip[2], ip[3], status, len);
+
+        // CRITICAL: If the result matches our local IP, it's almost certainly stale data
+        // from a previous getLocalIP() call that was still in the ESP32's buffer.
+        if (result != IPAddress(0,0,0,0) && result != _cachedIP) {
+          return result;
+        } else if (result == _cachedIP) {
+          Serial.println("[DNS] Ignoring stale Local IP in SPI buffer, waiting for real result...");
         }
+      } else if (status & STATUS_HAS_DATA) {
+        Serial.printf("[DNS] SPI RX Other: Status 0x%02X\r\n", status);
       }
     }
     delay(100);
@@ -271,15 +368,9 @@ IPAddress EspSpiDriver::getDNSServer() {
   digitalWrite(_cs, LOW);
   delayMicroseconds(50);
 
-  uint8_t status = SPI.transfer(0x00);
-  uint8_t lenHi  = SPI.transfer(0x00);
-  uint8_t lenLo  = SPI.transfer(0x00);
-  uint16_t len   = (lenHi << 8) | lenLo;
-
   uint8_t ip[4] = {0, 0, 0, 0};
-  if ((status & STATUS_HAS_DATA) && len == 4) {
-    for (int i = 0; i < 4; i++) ip[i] = SPI.transfer(0x00);
-  }
+  uint16_t len = 0;
+  _readResponseFrame(ip, sizeof(ip), &len);
 
   digitalWrite(_cs, HIGH);
   SPI.endTransaction();
@@ -312,6 +403,19 @@ int EspSpiDriver::parsePacket() {
   // again later, do it as its own careful investigation, not bundled
   // into the buzz chase.
   //
+  // Serve already-recovered downlink data first (see EspSpiDriver.h's
+  // _asyncRxQueue comment) - no live SPI activity needed, and this must
+  // win over a fresh poll below so an older recovered packet can't sit
+  // behind a newer live one and go stale.
+  if (_asyncRxQueueCount > 0) {
+    uint16_t len = _asyncRxQueueLen[_asyncRxQueueHead];
+    memcpy(_rxBuffer, _asyncRxQueue[_asyncRxQueueHead], len);
+    _rxLen = len;
+    _asyncRxQueueHead = (_asyncRxQueueHead + 1) % ASYNC_RX_QUEUE_SIZE;
+    _asyncRxQueueCount--;
+    return _rxLen;
+  }
+
   // Wait for any in-flight async SEND (see sendPacketTo()) to finish
   // before starting our own transaction - they share the same bus/CS
   // line. Same bounded-wait-with-safety-valve pattern as sendPacketTo().
@@ -328,7 +432,6 @@ int EspSpiDriver::parsePacket() {
   }
 
   if (digitalRead(_ready) == HIGH) {
-    uint32_t rxStart = micros();
     delayMicroseconds(500);
 
     SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
@@ -342,21 +445,21 @@ int EspSpiDriver::parsePacket() {
       uint8_t lenLo = SPI.transfer(0x00);
       uint16_t len = (lenHi << 8) | lenLo;
 
-      if (len > 0 && len < sizeof(_cfgBuffer)) {
+      int consumed = 3;
+      if (len > 0 && len < sizeof(_cfgQueue[0])) {
+        uint8_t cmdBuf[256];
         for (int i = 0; i < len; i++) {
-          _cfgBuffer[i] = SPI.transfer(0x00);
+          cmdBuf[i] = SPI.transfer(0x00);
         }
-        _cfgLen = len;
+        _queueRxConfigCmd(cmdBuf, len);
+        consumed += len;
       }
-      int consumed = 3 + (len < sizeof(_cfgBuffer) ? len : 0);
       while (consumed < MAX_SPI_BUF) {
         SPI.transfer(0x00);
         consumed++;
       }
       digitalWrite(_cs, HIGH);
       SPI.endTransaction();
-      _rxCallCount++;
-      _rxTotalUs += (micros() - rxStart);
       return 0;
     } else if (status & STATUS_HAS_DATA) {
       uint8_t lenHi = SPI.transfer(0x00);
@@ -379,8 +482,6 @@ int EspSpiDriver::parsePacket() {
       }
       digitalWrite(_cs, HIGH);
       SPI.endTransaction();
-      _rxCallCount++;
-      _rxTotalUs += (micros() - rxStart);
       return _rxLen;
     } else {
       for (int k = 1; k < MAX_SPI_BUF; k++) SPI.transfer(0x00);
@@ -389,8 +490,6 @@ int EspSpiDriver::parsePacket() {
 
     digitalWrite(_cs, HIGH);
     SPI.endTransaction();
-    _rxCallCount++;
-    _rxTotalUs += (micros() - rxStart);
 
     return _rxLen;
   }
@@ -410,9 +509,24 @@ int EspSpiDriver::read(uint8_t *buffer, size_t maxLen) {
 bool EspSpiDriver::isConnected() { return true; }
 
 IPAddress EspSpiDriver::getLocalIP() {
-  if (_cachedIP != IPAddress(0, 0, 0, 0)) return _cachedIP;
+  if (_cachedIP != IPAddress(0, 0, 0, 0) && (millis() - _cachedIPTime < CACHED_IP_TTL_MS)) {
+    return _cachedIP;
+  }
 
-  // Clear any pending unsolicited data before sending a command
+  // Clear any pending unsolicited data before sending a command.
+  //
+  // REVERTED (matching resolveHostname()'s 50ms/200ms drain-settle
+  // pattern, tried as a fix for a rare bogus-IP SPI glitch): this
+  // function is called from the main loop path every 5s, not on-demand
+  // like resolveHostname() - when there's a burst of queued items to
+  // drain (routine, not just during AP setup), the slower pattern could
+  // block the main loop for the better part of a second in one call.
+  // Teensy is single-threaded, so that starves gps.update() from running
+  // often enough and was observed causing real GPS lock loss - a far
+  // worse cost than the rare cosmetic bug it was meant to fix. Back to
+  // the original fast drain; the underlying SPI corruption question
+  // (possibly CS on the input-only IO35 pin) is still open but needs a
+  // fix that doesn't block the audio/GPS-critical main loop.
   while (digitalRead(_ready) == HIGH) {
     _drainOnePendingBlocking();
     delay(5);
@@ -434,82 +548,89 @@ IPAddress EspSpiDriver::getLocalIP() {
   digitalWrite(_cs, LOW);
   delayMicroseconds(50);
 
-  uint8_t status = SPI.transfer(0x00);
-  uint8_t lenHi  = SPI.transfer(0x00);
-  uint8_t lenLo  = SPI.transfer(0x00);
-  uint16_t len   = (lenHi << 8) | lenLo;
-
   uint8_t ip[4] = {0, 0, 0, 0};
-  if ((status & STATUS_HAS_DATA) && len == 4) {
-    for (int i = 0; i < 4; i++) ip[i] = SPI.transfer(0x00);
-  }
-
-  // Pad to 512
-  int consumed = 3 + (len == 4 ? 4 : 0);
-  while (consumed < MAX_SPI_BUF) {
-      SPI.transfer(0x00);
-      consumed++;
-  }
+  uint16_t len = 0;
+  _readResponseFrame(ip, sizeof(ip), &len);
 
   digitalWrite(_cs, HIGH);
   SPI.endTransaction();
 
   IPAddress result(ip[0], ip[1], ip[2], ip[3]);
-  if (result != IPAddress(0, 0, 0, 0)) _cachedIP = result;
+  if (result != IPAddress(0, 0, 0, 0)) {
+    _cachedIP = result;
+    _cachedIPTime = millis();
+  }
   return result;
 }
-
-IPAddress EspSpiDriver::getSubnetMask() { return IPAddress(0, 0, 0, 0); }
-IPAddress EspSpiDriver::getGateway() { return IPAddress(0, 0, 0, 0); }
-IPAddress EspSpiDriver::getDNS() { return getDNSServer(); }
 
 void EspSpiDriver::setTarget(IPAddress ip, uint16_t port) {
   _targetIP = ip;
   _targetPort = port;
 }
 
-void EspSpiDriver::pushConfig(const void *configData, uint16_t configLen) {
-  if (configLen > 500) return;
-  delay(5);
+void EspSpiDriver::_pushBlob(uint8_t cmd, const void *blobData, uint16_t blobLen) {
+  if (blobLen > 500) return;
 
-  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(_cs, LOW);
-  delayMicroseconds(50);
+  // The ESP32 aborts (STATUS_HAS_DATA in the first status byte) if it
+  // already has something else queued to send - originally fine since
+  // pushConfig() only ever ran once at boot when there's little other
+  // traffic. GPS status now shares this same helper but pushes every 5s
+  // *during* active voter/audio traffic, when the ESP32 very often has
+  // something queued - a single attempt was landing on a busy ESP32
+  // often enough that it could go indefinitely without ever getting a
+  // push through. Retry a few times, a beat apart, rather than requiring
+  // pure luck.
+  for (int attempt = 0; attempt < 5; attempt++) {
+    delay(5);
 
-  uint8_t status = SPI.transfer(CMD_PUSH_CONFIG);
-  if (status & STATUS_HAS_DATA) {
-      digitalWrite(_cs, HIGH);
-      SPI.endTransaction();
-      return;
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(_cs, LOW);
+    delayMicroseconds(50);
+
+    uint8_t status = SPI.transfer(cmd);
+    if (status & STATUS_HAS_DATA) {
+        digitalWrite(_cs, HIGH);
+        SPI.endTransaction();
+        continue; // busy - try again
+    }
+
+    SPI.transfer((blobLen >> 8) & 0xFF);
+    SPI.transfer(blobLen & 0xFF);
+
+    const uint8_t *data = (const uint8_t *)blobData;
+    for (uint16_t i = 0; i < blobLen; i++) {
+      SPI.transfer(data[i]);
+    }
+
+    // Pad to 512
+    int sent = 3 + blobLen;
+    while (sent < MAX_SPI_BUF) {
+        SPI.transfer(0x00);
+        sent++;
+    }
+
+    digitalWrite(_cs, HIGH);
+    SPI.endTransaction();
+    return;
   }
-
-  SPI.transfer((configLen >> 8) & 0xFF);
-  SPI.transfer(configLen & 0xFF);
-
-  const uint8_t *data = (const uint8_t *)configData;
-  for (uint16_t i = 0; i < configLen; i++) {
-    SPI.transfer(data[i]);
-  }
-
-  // Pad to 512
-  int sent = 3 + configLen;
-  while (sent < MAX_SPI_BUF) {
-      SPI.transfer(0x00);
-      sent++;
-  }
-
-  digitalWrite(_cs, HIGH);
-  SPI.endTransaction();
 }
 
-bool EspSpiDriver::hasConfigCmd() { return _cfgLen > 0; }
+void EspSpiDriver::pushConfig(const void *configData, uint16_t configLen) {
+  _pushBlob(CMD_PUSH_CONFIG, configData, configLen);
+}
+
+void EspSpiDriver::pushGpsStatus(const GpsStatus *status) {
+  _pushBlob(CMD_PUSH_GPS_STATUS, status, sizeof(GpsStatus));
+}
+
+bool EspSpiDriver::hasConfigCmd() { return _cfgQueueCount > 0; }
 
 int EspSpiDriver::readConfigCmd(uint8_t *buffer, size_t maxLen) {
-  if (_cfgLen > 0) {
-    size_t copyLen = (_cfgLen < (int)maxLen) ? _cfgLen : maxLen;
-    memcpy(buffer, _cfgBuffer, copyLen);
-    _cfgLen = 0;
-    return copyLen;
-  }
-  return 0;
+  if (_cfgQueueCount == 0) return 0;
+  uint8_t srcLen = _cfgQueueLen[_cfgQueueHead];
+  size_t copyLen = (srcLen < (uint8_t)maxLen) ? srcLen : maxLen;
+  memcpy(buffer, _cfgQueue[_cfgQueueHead], copyLen);
+  _cfgQueueHead = (_cfgQueueHead + 1) % CFG_RX_QUEUE_SIZE;
+  _cfgQueueCount--;
+  return copyLen;
 }

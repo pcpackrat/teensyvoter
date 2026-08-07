@@ -1,17 +1,18 @@
 /*
   TeensyVoter - Voter Receiver/Transmitter Firmware
   Platform: Teensy 4.1 + Audio Shield
-  Network: ESP32 (SPI) or Native Ethernet
+  Network: ESP32 (SPI) - WiFi today, wired Ethernet once the WT32-ETH01
+  migration (see docs/esp32_network_migration_plan.md) lands. The Teensy's
+  own NativeEthernet/TeensyWebServer stack has been removed entirely -
+  ESP32/SPI is the sole network path.
 
   Dependencies:
-  - FNET (NativeEthernet)
   - Audio, SPI, Wire
   - TinyGPSPlus
 */
 
 #include <Arduino.h>
 #include <Audio.h>
-#include <NativeEthernet.h>
 #include <SPI.h>
 #include <TimeLib.h>
 #include <Wire.h>
@@ -20,12 +21,10 @@
 #include "ConfigManager.h"
 #include "DSPProcessor.h"
 #include "EspSpiDriver.h"
-#include "EthernetDriver.h"
 #include "GPSManager.h"
 #include "NetworkManager.h"
 #include "VoterClient.h"
 #include "VoterProtocol.h"
-#include "TeensyWebServer.h"
 #include "Version.h"
 #include "Logger.h"
 
@@ -35,6 +34,17 @@
 #define PPS_PIN 2   // GPS PPS Input
 
 #define GPS_SERIAL Serial1 // GPS Module RX/TX (Pins 0/1)
+
+// ESP32 flashing passthrough (see docs/wiring_pin_table.csv). EN reuses
+// the same pin the SPI driver already resets the ESP32 with. GPIO0 must
+// stay high-impedance except during the brief bootloader-entry pulse -
+// once the ESP32 boots normally this same pin is its Ethernet PHY clock
+// input, and the board's own onboard pull-up (standard on ESP32 boards,
+// not yet bench-confirmed on this one) is what holds it high the rest
+// of the time. Driving it continuously would fight that clock signal.
+#define ESP32_EN_PIN 25
+#define ESP32_GPIO0_PIN 27
+#define ESP32_UART_SERIAL Serial8 // Teensy pins 34(RX8)/35(TX8) <-> ESP32 TXO/RXO
 
 // --- Global State ---
 float g_headphoneVol = 0.5f;
@@ -118,23 +128,20 @@ AudioConnection patchCordMeter(mixerRX, 0, peak1, 0);
 AudioControlSGTL5000 sgtl5000_1;
 
 // --- Global Objects ---
-// Network Drivers (Auto-select: Ethernet first, fallback to WiFi)
-EthernetDriver ethDriver;
+// Network Driver: ESP32 over SPI (sole path - see file header)
 EspSpiDriver spiDriver(26, 24, 25); // CS=26 (Uncovered), Ready=24, Reset=25
 NetworkManager netMgr;
 VoterClient voterClient;
 GPSManager gps;
 DSPProcessor dsp;
-WebServer webServer;
-// WebInterface web;
 ConfigManager cfg;
 bool networkReady = false; // Global: set in setup(), used in loop()
-
-byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 
 // --- Forward Declarations ---
 void handleSerialCLI();
 void printMenu();
+void enterEsp32FlashPassthrough();
+void enterEsp32BootloaderHold();
 
 // --- Yield Callback for blocking network operations ---
 void voterYield() {
@@ -158,6 +165,12 @@ void setup() {
   Serial.begin(9600);
   delay(100);
 
+  // Default high-impedance - see ESP32_GPIO0_PIN comment above. Only ever
+  // driven low by enterEsp32FlashPassthrough()/enterEsp32BootloaderHold(),
+  // for the duration of a bootloader-entry pulse (or, for the hold
+  // variant, until the user explicitly releases it).
+  pinMode(ESP32_GPIO0_PIN, INPUT);
+
   // Increase GPS Serial Buffer to handle stalls during DNS resolution
   static uint8_t gpsReadBuffer[2048];
   GPS_SERIAL.addMemoryForRead(gpsReadBuffer, sizeof(gpsReadBuffer));
@@ -167,9 +180,7 @@ void setup() {
   Serial.print("TeensyVoter Firmware v");
   Serial.println(FIRMWARE_VERSION);
   Serial.print("Build Date: ");
-  Serial.print(BUILD_DATE);
-  Serial.print(" ");
-  Serial.println(BUILD_TIME);
+  Serial.println(BUILD_DATE);
   Serial.println("========================================");
   Serial.println();
 
@@ -197,8 +208,6 @@ void setup() {
   Serial.println(cfg.getHostIP());
   Serial.print("Port: ");
   Serial.println(cfg.data.hostPort);
-  Serial.print("WiFi SSID: ");
-  Serial.println(cfg.data.wifiSSID);
   Serial.println("---------------------");
 
   // Init Menus
@@ -283,102 +292,77 @@ void setup() {
 
   Serial.println("[System] Boot Complete: Audio + Network + GPS");
 
-  // 3. Network - Auto-select: Try Ethernet first, fallback to WiFi
+  // 3. Network - ESP32 over SPI (sole path; see file header)
   Serial.println("[System] Initializing Network Driver...");
 
   networkReady = false;
 
-  // Try Ethernet first
-  Serial.println("[Network] Attempting Ethernet (NativeEthernet)...");
-
-  bool ethSuccess = false;
-  if (cfg.data.useStaticIP) {
-    // Use static IP configuration
-    IPAddress staticIP(cfg.data.staticIP);
-    IPAddress subnet(cfg.data.subnetMask);
-    IPAddress gw(cfg.data.gateway);
-    IPAddress dns(cfg.data.staticDNS);
-    ethSuccess = ethDriver.begin(mac, staticIP, subnet, gw, dns);
-  } else {
-    // Use DHCP
-    ethSuccess = ethDriver.begin(mac);
-  }
-
-  if (ethSuccess) {
-    Serial.println("[Network] ✓ Ethernet Connected!");
-    netMgr.begin(&ethDriver, mac);
-    netMgr.setYieldCallback(voterYield);
-    networkReady = true;
-  }
- else {
-    Serial.println(
-        "[Network] ✗ Ethernet unavailable (no cable or DHCP failure)");
-
-    // Fallback to WiFi
-    Serial.println("[Network] Falling back to WiFi (ESP32 SPI)...");
-
-    // Initialize WiFi driver (This completely hard-resets the ESP32 and starts the SPI bus)
-    if (spiDriver.begin(mac)) {
-      // Give ESP32 time to boot AFTER the hardware reset
-      Serial.println("[System] Waiting for ESP32 Boot (5s)...");
-      uint32_t bootStart = millis();
-      while (millis() - bootStart < 5000) {
-        handleSerialCLI();
-        delay(10);
-      }
-
-      // Send WiFi Credentials (retry 3x to guarantee delivery across SPI slave arming gaps)
-      for (int attempt = 1; attempt <= 3; attempt++) {
-        Serial.printf("[System] Sending WiFi Credentials (attempt %d/3)...\r\n", attempt);
-        spiDriver.setCredentials(cfg.data.wifiSSID, cfg.data.wifiPass);
-        delay(200); // Allow ESP32 to process before next attempt
-      }
-
-      spiDriver.setStaticDNS(IPAddress(cfg.data.dnsServerIP));
-      netMgr.begin(&spiDriver, mac);
-      netMgr.setYieldCallback(voterYield);
-
-      // Wait for IP (up to 45s) with Audio Maintenance & CLI access
-      Serial.print("[System] Waiting for WiFi Connection");
-      bool ipFound = false;
-      for (int i = 0; i < 90; i++) { // 90 * 500ms = 45 seconds
-        // Maintain Audio Queue (Prevent Overflow/Crash)
-        while (recordQueue.available() > 0) {
-          recordQueue.readBuffer();
-          recordQueue.freeBuffer();
-        }
-
-        // Keep Serial CLI responsive during connection
-        handleSerialCLI();
-
-        // Check IP
-        IPAddress myIP = netMgr.getLocalIP();
-        if (myIP != IPAddress(0, 0, 0, 0)) {
-          Serial.println();
-          Serial.print("[System] WiFi Connected! IP: ");
-          Serial.println(myIP);
-          ipFound = true;
-          networkReady = true;
-
-          // Push full config to ESP32 for its web server
-          delay(200); // Let ESP32 settle
-          spiDriver.pushConfig(&cfg.data, sizeof(cfg.data));
-
-          break;
-        }
-
-        Serial.print(".");
-        delay(500);
-      }
-
-      if (!ipFound) {
-        Serial.println(
-            "\n[System] WARNING: WiFi Connection Timeout or Retrieval Failed.");
-        Serial.println("[System] Check SSID/Password or ESP32 Link.");
-      }
-    } else {
-      Serial.println("[Network] ✗ WiFi driver initialization failed!");
+  // Init ESP32 driver (this hard-resets the ESP32 and starts the SPI bus)
+  if (spiDriver.begin()) {
+    // Give ESP32 time to boot AFTER the hardware reset
+    Serial.println("[System] Waiting for ESP32 Boot (5s)...");
+    uint32_t bootStart = millis();
+    while (millis() - bootStart < 5000) {
+      handleSerialCLI();
+      delay(10);
     }
+
+    // Push full config to the ESP32 now, before it brings up any network
+    // interface - it needs useStaticIP/staticIP/etc. to know how to
+    // configure Ethernet, and wifiSSID/wifiPass to have WiFi fallback
+    // credentials ready, so this can no longer wait until after a
+    // connection like it used to (that was a chicken-and-egg: it can't
+    // reach a static IP without already knowing the static IP).
+    delay(200); // Let ESP32 settle after boot before the first transaction
+    Serial.println("[System] Pushing configuration to ESP32...");
+    spiDriver.pushConfig(&cfg.data, sizeof(cfg.data));
+
+    spiDriver.setStaticDNS(IPAddress(cfg.data.dnsServerIP));
+    netMgr.begin(&spiDriver);
+    netMgr.setYieldCallback(voterYield);
+
+    // Wait for IP with Audio Maintenance & CLI access. Covers both a
+    // direct Ethernet link and, if that doesn't come up, the ESP32
+    // falling back to WiFi on its own (see Spirit.cpp) - the ESP32 side
+    // already bounds its own worst case fast (link-down detected and
+    // WiFi fallback attempted within ~3s, association/DHCP a few
+    // seconds more), so this no longer needs to be a long timeout on
+    // top of that; 20s at a 250ms poll gives a bit of margin over the
+    // ESP32's own bound instead of sitting idle well past it.
+    Serial.print("[System] Waiting for Network Link");
+    bool ipFound = false;
+    for (int i = 0; i < 80; i++) { // 80 * 250ms = 20 seconds
+      // Maintain Audio Queue (Prevent Overflow/Crash)
+      while (recordQueue.available() > 0) {
+        recordQueue.readBuffer();
+        recordQueue.freeBuffer();
+      }
+
+      // Keep Serial CLI responsive during connection
+      handleSerialCLI();
+
+      // Check IP
+      IPAddress myIP = netMgr.getLocalIP();
+      if (myIP != IPAddress(0, 0, 0, 0)) {
+        Serial.println();
+        Serial.print("[System] Network Connected! IP: ");
+        Serial.println(myIP);
+        ipFound = true;
+        networkReady = true;
+        break;
+      }
+
+      Serial.print(".");
+      delay(250);
+    }
+
+    if (!ipFound) {
+      Serial.println(
+          "\n[System] WARNING: Network link timeout or IP retrieval failed.");
+      Serial.println("[System] Check cable/WiFi credentials and ESP32 link.");
+    }
+  } else {
+    Serial.println("[Network] ✗ ESP32 driver initialization failed!");
   }
 
   if (!networkReady) {
@@ -397,12 +381,7 @@ void setup() {
       Serial.println(cfg.data.hostname);
       Serial.println("[DNS] Resolving...");
 
-      IPAddress resolvedIP;
-      if (netMgr.getType() == DRIVER_WIFI_SPI) {
-        resolvedIP = spiDriver.resolveHostname(cfg.data.hostname);
-      } else if (netMgr.getType() == DRIVER_ETHERNET) {
-        resolvedIP = ethDriver.resolveHostname(cfg.data.hostname);
-      }
+      IPAddress resolvedIP = spiDriver.resolveHostname(cfg.data.hostname);
 
       if (resolvedIP != IPAddress(0, 0, 0, 0)) {
         cfg.setHostIP(resolvedIP);
@@ -454,12 +433,7 @@ void setup() {
     Serial.println(status);
   }
 
-  // 7. Web Server
-  webServer.setConfig(&cfg);
-  webServer.setSystemObjects(&netMgr, &voterClient, &gps);
-  webServer.begin();
-
-  // 8. Logger (only start if network available)
+  // 7. Logger (only start if network available)
   if (networkReady) {
     logger.begin(&netMgr, &cfg);
     logger.info("SYS", "TeensyVoter v%s Boot Complete", FIRMWARE_VERSION);
@@ -499,7 +473,8 @@ enum MenuState {
   MENU_NETWORK,
   MENU_VOTER_CONFIG,
   MENU_RADIO_CONFIG,
-  MENU_DEBUG
+  MENU_DEBUG,
+  MENU_FIRMWARE
 };
 MenuState g_menuState = MENU_MAIN;
 
@@ -684,9 +659,17 @@ void printMenu() {
     Serial.println(" [3] Radio Config Menu >>");
     Serial.println(" [4] Debug Menu >>");
     Serial.println(" [5] Voter Config Menu >>");
+    Serial.println(" [6] Firmware Menu >>");
     Serial.println("----------------------------------------");
     Serial.println(" [S] Save & Reboot");
     Serial.println(" [M] Refresh Menu");
+  } else if (g_menuState == MENU_FIRMWARE) {
+    Serial.println("           FIRMWARE MENU");
+    Serial.println("========================================");
+    Serial.println(" [1] Enter ESP32 Bootloader Mode (hold, no bridge)");
+    Serial.println(" [2] Flash ESP32 (Passthrough Bridge)");
+    Serial.println("----------------------------------------");
+    Serial.println(" [x] Back to Main Menu");
   } else if (g_menuState == MENU_STATUS) {
     IPAddress local = netMgr.getLocalIP();
     Serial.println("           STATUS MENU");
@@ -742,66 +725,21 @@ void printMenu() {
     Serial.println("           NETWORK MENU");
     Serial.println("========================================");
 
-    // Show active network type
-    if (netMgr.getType() == DRIVER_ETHERNET) {
-      Serial.println(" Network: Ethernet (NativeEthernet)");
-    } else if (netMgr.getType() == DRIVER_WIFI_SPI) {
-      Serial.println(" Network: WiFi (ESP32 SPI)");
-    }
+    Serial.println(" Network: Ethernet + WiFi Fallback (ESP32 SPI)");
 
     IPAddress ip = netMgr.getLocalIP();
     Serial.printf(" IP Address  : %u.%u.%u.%u\r\n", ip[0], ip[1], ip[2], ip[3]);
 
-    // Only show full IP config for Ethernet (WiFi SPI doesn't support subnet/gw queries)
-    if (netMgr.getType() == DRIVER_ETHERNET) {
-      IPAddress subnet = netMgr.getSubnetMask();
-      IPAddress gw = netMgr.getGateway();
-      IPAddress dns = netMgr.getDNS();
-      Serial.printf(" Subnet Mask : %u.%u.%u.%u\r\n", subnet[0], subnet[1],
-                    subnet[2], subnet[3]);
-      Serial.printf(" Gateway     : %u.%u.%u.%u\r\n", gw[0], gw[1], gw[2], gw[3]);
-      Serial.printf(" DNS Server  : %u.%u.%u.%u\r\n", dns[0], dns[1], dns[2],
-                    dns[3]);
-    }
-
     Serial.println("----------------------------------------");
 
-    // Ethernet static IP options (only show when using Ethernet)
-    if (netMgr.getType() == DRIVER_ETHERNET) {
-      Serial.printf(" [1] Use Static IP: %s\r\n",
-                    cfg.data.useStaticIP ? "YES" : "NO (DHCP)");
-      if (cfg.data.useStaticIP) {
-        IPAddress sip(cfg.data.staticIP);
-        IPAddress smask(cfg.data.subnetMask);
-        IPAddress gw(cfg.data.gateway);
-        IPAddress sdns(cfg.data.staticDNS);
-        Serial.printf(" [2] Static IP   : %u.%u.%u.%u\r\n", sip[0], sip[1],
-                      sip[2], sip[3]);
-        Serial.printf(" [3] Subnet Mask : %u.%u.%u.%u\r\n", smask[0], smask[1],
-                      smask[2], smask[3]);
-        Serial.printf(" [4] Gateway     : %u.%u.%u.%u\r\n", gw[0], gw[1], gw[2],
-                      gw[3]);
-        if (sdns != IPAddress(0, 0, 0, 0)) {
-          Serial.printf(" [5] DNS Server  : %u.%u.%u.%u\r\n", sdns[0], sdns[1],
-                        sdns[2], sdns[3]);
-        } else {
-          Serial.println(" [5] DNS Server  : (Use Gateway)");
-        }
-      }
-    }
+    Serial.printf(" [1] WiFi SSID   : %s\r\n", cfg.data.wifiSSID[0] ? cfg.data.wifiSSID : "(not set)");
+    Serial.println(" [2] Set WiFi Password");
 
-    // WiFi-specific options (only show when using WiFi)
-    if (netMgr.getType() == DRIVER_WIFI_SPI) {
-      Serial.printf(" [1] WiFi SSID   : %s\r\n", cfg.data.wifiSSID);
-      Serial.println(" [2] Set WiFi Password");
-      Serial.println(" [R] Resend WiFi Credentials to ESP32");
-      
-      IPAddress wdns(cfg.data.dnsServerIP);
-      if (wdns != IPAddress(0, 0, 0, 0)) {
-        Serial.printf(" [3] WiFi DNS    : %u.%u.%u.%u\r\n", wdns[0], wdns[1], wdns[2], wdns[3]);
-      } else {
-        Serial.println(" [3] WiFi DNS    : (DHCP Default)");
-      }
+    IPAddress wdns(cfg.data.dnsServerIP);
+    if (wdns != IPAddress(0, 0, 0, 0)) {
+      Serial.printf(" [3] DNS Server  : %u.%u.%u.%u\r\n", wdns[0], wdns[1], wdns[2], wdns[3]);
+    } else {
+      Serial.println(" [3] DNS Server  : (DHCP Default)");
     }
 
     Serial.println(" -- Syslog Settings --");
@@ -903,6 +841,120 @@ void printMenu() {
   Serial.print("> ");
 }
 
+// Bridges USB serial <-> ESP32 UART0 so esptool can flash the ESP32
+// through the Teensy without physical access to the module. Blocking:
+// takes over the main loop (radio/GPS/network all stop) for the
+// duration. Exits on its own after a hard time cap, or sooner once
+// traffic goes idle after esptool has actually connected - there's no
+// way to detect "esptool is done" directly since the bridge is fully
+// occupied relaying raw bytes, so this is a deliberate approximation,
+// not a precise handshake. On exit, reboots the Teensy (which re-runs
+// spiDriver.begin() and resets the ESP32 into its newly-flashed app,
+// same as any other Teensy boot).
+void enterEsp32FlashPassthrough() {
+  Serial.println("\r\n[FLASH] ESP32 passthrough mode.");
+  Serial.println("[FLASH] This takes over USB serial and resets the ESP32 into its ROM bootloader.");
+  Serial.println("[FLASH] Radio/network stop until this exits. Continue? (y/n): ");
+  String resp = readStringEcho();
+  resp.trim();
+  if (resp.length() == 0 || (resp[0] != 'y' && resp[0] != 'Y')) {
+    Serial.println("[FLASH] Cancelled.");
+    return;
+  }
+
+  pinMode(ESP32_GPIO0_PIN, OUTPUT);
+  digitalWrite(ESP32_GPIO0_PIN, LOW); // hold low through the reset pulse below
+
+  pinMode(ESP32_EN_PIN, OUTPUT);
+  digitalWrite(ESP32_EN_PIN, LOW);
+  delay(100);
+  digitalWrite(ESP32_EN_PIN, HIGH); // ESP32 resets, samples GPIO0 low -> ROM bootloader
+  delay(200);
+
+  // Boot-mode sampling is done; release GPIO0 back to high-Z so it
+  // doesn't fight the Ethernet PHY clock this pin carries once the ESP32
+  // is running again (moot while it's sitting in the ROM bootloader, but
+  // no reason to hold it either).
+  pinMode(ESP32_GPIO0_PIN, INPUT);
+
+  ESP32_UART_SERIAL.begin(115200); // must match esptool.py --baud
+
+  Serial.println("[FLASH] ESP32 is in its ROM bootloader. From your PC:");
+  Serial.println("[FLASH]   esptool.py --port <this COM port> --baud 115200 write_flash ...");
+  Serial.println("[FLASH] Bridging bytes now. Auto-exits after 5 min, or 15s after traffic goes idle.");
+
+  const uint32_t HARD_CAP_MS = 5UL * 60UL * 1000UL;
+  const uint32_t IDLE_EXIT_MS = 15UL * 1000UL;
+  uint32_t sessionStart = millis();
+  uint32_t lastActivity = millis();
+  bool sawTraffic = false;
+
+  while (true) {
+    bool activity = false;
+    while (Serial.available()) {
+      ESP32_UART_SERIAL.write((uint8_t)Serial.read());
+      activity = true;
+    }
+    while (ESP32_UART_SERIAL.available()) {
+      Serial.write((uint8_t)ESP32_UART_SERIAL.read());
+      activity = true;
+    }
+    if (activity) {
+      lastActivity = millis();
+      sawTraffic = true;
+    }
+    if (millis() - sessionStart > HARD_CAP_MS) break;
+    if (sawTraffic && (millis() - lastActivity > IDLE_EXIT_MS)) break;
+  }
+
+  ESP32_UART_SERIAL.end();
+
+  Serial.println("\r\n[FLASH] Passthrough session ended. Rebooting Teensy to restore normal operation...");
+  delay(500);
+  SCB_AIRCR = 0x05FA0004;
+}
+
+// Standalone bootloader-entry test/hold: does the exact same GPIO0/EN
+// sequence as enterEsp32FlashPassthrough(), but stops there instead of
+// also bridging UART - useful for confirming the sequence itself works
+// (or for using an external USB-serial adapter on the ESP32's own UART0
+// pins instead of going through the Teensy) without committing to a full
+// flash session. GPIO0 stays held low the whole time this is active,
+// same caveat as always: that's also the Ethernet clock pin, so this
+// isn't something to leave running any longer than needed.
+void enterEsp32BootloaderHold() {
+  Serial.println("\r\n[FLASH] Hold ESP32 in ROM bootloader mode (no UART bridge).");
+  Serial.println("[FLASH] Radio/network stop while this is held. Continue? (y/n): ");
+  String resp = readStringEcho();
+  resp.trim();
+  if (resp.length() == 0 || (resp[0] != 'y' && resp[0] != 'Y')) {
+    Serial.println("[FLASH] Cancelled.");
+    return;
+  }
+
+  pinMode(ESP32_GPIO0_PIN, OUTPUT);
+  digitalWrite(ESP32_GPIO0_PIN, LOW); // hold low through and after the reset pulse
+
+  pinMode(ESP32_EN_PIN, OUTPUT);
+  digitalWrite(ESP32_EN_PIN, LOW);
+  delay(100);
+  digitalWrite(ESP32_EN_PIN, HIGH); // ESP32 resets, samples GPIO0 low -> ROM bootloader
+  delay(200);
+
+  Serial.println("[FLASH] ESP32 should now be in its ROM bootloader (GPIO0 held low, EN pulsed high).");
+  Serial.println("[FLASH] Held indefinitely for testing. Press any key to release and reboot the Teensy.");
+
+  while (!Serial.available()) {
+    delay(10);
+  }
+  while (Serial.available()) Serial.read(); // drain the keypress
+
+  pinMode(ESP32_GPIO0_PIN, INPUT); // release back to high-Z
+  Serial.println("\r\n[FLASH] Released. Rebooting Teensy to restore normal operation...");
+  delay(500);
+  SCB_AIRCR = 0x05FA0004;
+}
+
 void handleSerialCLI() {
   if (Serial.available() > 0) {
     char c = Serial.read();
@@ -938,6 +990,10 @@ void handleSerialCLI() {
         g_menuState = MENU_VOTER_CONFIG;
         printMenu();
         break;
+      case '6':
+        g_menuState = MENU_FIRMWARE;
+        printMenu();
+        break;
 
       // System
       case 's':
@@ -950,6 +1006,17 @@ void handleSerialCLI() {
       case 'm':
       case 'M':
         printMenu();
+        break;
+      }
+    } else if (g_menuState == MENU_FIRMWARE) {
+      switch (c) {
+      case '1':
+        enterEsp32BootloaderHold();
+        printMenu(); // only reached if cancelled - success path reboots
+        break;
+      case '2':
+        enterEsp32FlashPassthrough();
+        printMenu(); // only reached if cancelled - success path reboots
         break;
       }
     } else if (g_menuState == MENU_STATUS) {
@@ -969,67 +1036,32 @@ void handleSerialCLI() {
     } else if (g_menuState == MENU_NETWORK) {
       switch (c) {
 
-      // Ethernet Configuration
       case '1':
-        if (netMgr.getType() == DRIVER_ETHERNET) {
-          cfg.data.useStaticIP = !cfg.data.useStaticIP;
-          Serial.printf("\r\n[Network] Static IP %s\r\n",
-                        cfg.data.useStaticIP ? "ENABLED" : "DISABLED");
-          if (cfg.data.useStaticIP) {
-            Serial.println(
-                "[Network] NOTE: Reboot required for changes to take effect");
-          }
-          printMenu();
-        } else if (netMgr.getType() == DRIVER_WIFI_SPI) {
-          Serial.print("\r\nEnter WiFi SSID: ");
+        Serial.print("\r\nEnter WiFi SSID (fallback if Ethernet is down): ");
+        {
           String s = readStringEcho();
           s.trim();
-          if (s.length() < 32)
+          if (s.length() < sizeof(cfg.data.wifiSSID))
             strcpy(cfg.data.wifiSSID, s.c_str());
-          printMenu();
         }
+        printMenu();
         break;
 
       case '2':
-        if (netMgr.getType() == DRIVER_ETHERNET && cfg.data.useStaticIP) {
-          Serial.print("\r\nEnter Static IP: ");
+        Serial.print("\r\nEnter WiFi Password: ");
+        {
           String s = readStringEcho();
           s.trim();
-          IPAddress ip;
-          if (ip.fromString(s)) {
-            cfg.data.staticIP = (uint32_t)ip;
-            Serial.println("\r\n[Network] Static IP updated");
-          } else {
-            Serial.println("\r\n[Network] Invalid IP address");
-          }
-          printMenu();
-        } else if (netMgr.getType() == DRIVER_WIFI_SPI) {
-          Serial.print("\r\nEnter WiFi Pass: ");
-          String s = readStringEcho();
-          s.trim();
-          if (s.length() < 64)
+          if (s.length() < sizeof(cfg.data.wifiPass))
             strcpy(cfg.data.wifiPass, s.c_str());
-          printMenu();
         }
+        printMenu();
         break;
 
       case '3':
-        if (netMgr.getType() == DRIVER_ETHERNET && cfg.data.useStaticIP) {
-          Serial.print("\r\nEnter Subnet Mask: ");
-          String s = readStringEcho();
-          s.trim();
-          IPAddress mask;
-          if (mask.fromString(s)) {
-            cfg.data.subnetMask = (uint32_t)mask;
-            Serial.println("\r\n[Network] Subnet mask updated");
-          } else {
-            Serial.println("\r\n[Network] Invalid subnet mask");
-          }
-          printMenu();
-        } else if (netMgr.getType() == DRIVER_WIFI_SPI) {
-          // WiFi DNS
-          Serial.print(
-              "\r\nEnter DNS Server IP (or 0.0.0.0 for DHCP default): ");
+        Serial.print(
+            "\r\nEnter DNS Server IP (or 0.0.0.0 for DHCP default): ");
+        {
           String s = readStringEcho();
           s.trim();
           if (s.length() > 0) {
@@ -1038,47 +1070,10 @@ void handleSerialCLI() {
               cfg.data.dnsServerIP = (uint32_t)dns;
             }
           }
-          printMenu();
         }
+        printMenu();
         break;
 
-      case '4':
-        if (netMgr.getType() == DRIVER_ETHERNET && cfg.data.useStaticIP) {
-          Serial.print("\r\nEnter Gateway IP: ");
-          String s = readStringEcho();
-          s.trim();
-          IPAddress gw;
-          if (gw.fromString(s)) {
-            cfg.data.gateway = (uint32_t)gw;
-            Serial.println("\r\n[Network] Gateway updated");
-          } else {
-            Serial.println("\r\n[Network] Invalid gateway address");
-          }
-          printMenu();
-        }
-        break;
-
-      case '5':
-        if (netMgr.getType() == DRIVER_ETHERNET && cfg.data.useStaticIP) {
-          Serial.print("\r\nEnter DNS Server IP (or 0.0.0.0 to use gateway): ");
-          String s = readStringEcho();
-          s.trim();
-          if (s.length() > 0) {
-            IPAddress dns;
-            if (dns.fromString(s)) {
-              cfg.data.staticDNS = (uint32_t)dns;
-              Serial.println("\r\n[Network] Static DNS updated");
-            }
-          }
-          printMenu();
-        }
-        break;
-
-      case 'r':
-      case 'R':
-        Serial.println("Resending Credentials...");
-        spiDriver.setCredentials(cfg.data.wifiSSID, cfg.data.wifiPass);
-        break;
       case '6':
         cfg.data.useSyslog = !cfg.data.useSyslog;
         printMenu();
@@ -1429,18 +1424,15 @@ void handleSerialCLI() {
                     (int)(((float)cfg.data.dspSquelchThresh / 255.0f) * 50.0f);
               }
 
-              // Gate Logic for Meter
-              bool isCosActive = false;
-              if (cfg.data.cosMode == COS_MODE_DSP) {
-                isCosActive = (localMax * 100.0f) > cfg.data.dspSquelchThresh;
-              } else if (cfg.data.cosMode == COS_MODE_HARDWARE) {
-                isCosActive =
-                    (digitalRead(COS_PIN) == (cfg.data.cosInvert ? LOW : HIGH));
-              } else {
-                isCosActive = true; // COS_MODE_ON
-              }
-
-              if (isCosActive) {
+              // Gate logic for the meter - reuses isCosActive computed
+              // above instead of a second, independent calculation. That
+              // second copy used to exist here with the HARDWARE polarity
+              // backwards and DSP mode driven by peak level instead of
+              // noise level - disagreed with both the text status right
+              // above it AND the actual PTT/squelch-gating logic elsewhere
+              // in this file (see finalRSSI/g_cosActive), which agree with
+              // each other and with the text display, not this bar graph.
+              if (!isCosActive) {
                 bars = 0; // Force empty meter if squelch closed
               }
 
@@ -1527,6 +1519,23 @@ void handleSerialCLI() {
 }
 
 void loop() {
+  // Diagnostic only, not a fix: flag any single loop() iteration that
+  // takes abnormally long, so a stall can be correlated against the
+  // GPS/audio timestamps already being logged instead of guessing blind
+  // at what's blocking. Measures the gap since the previous iteration's
+  // start, i.e. the previous iteration's full duration - negligible
+  // overhead itself (one micros() call + comparison), only prints when
+  // something's actually wrong.
+  static uint32_t lastLoopStart = 0;
+  uint32_t loopStart = micros();
+  if (lastLoopStart != 0) {
+    uint32_t iterDuration = loopStart - lastLoopStart;
+    if (iterDuration > 20000) {
+      Serial.printf("[TIMING] loop() iteration took %lu us\r\n", (unsigned long)iterDuration);
+    }
+  }
+  lastLoopStart = loopStart;
+
   // Auto-Show Menu on Connect or Error (Final State)
   static VoterState lastReportedState = VOTER_DISCONNECTED;
   VoterState currentState = voterClient.getState();
@@ -1551,6 +1560,25 @@ void loop() {
   }
 
   netMgr.update();
+
+  // Push GPS telemetry to the ESP32 for its status page. Live status, not
+  // persisted config, so it rides its own periodic push rather than
+  // piggybacking on the config-push path. Gated on networkReady - only
+  // useful once the ESP32's web UI is actually up.
+  if (networkReady) {
+    static uint32_t lastGpsPush = 0;
+    if (millis() - lastGpsPush > 5000) {
+      lastGpsPush = millis();
+      GpsStatus gs;
+      memset(&gs, 0, sizeof(gs));
+      gs.satellites = gps.getSatellites();
+      gs.ppsJitterUs = gps.getPpsJitter();
+      gs.locked = gps.isLocked();
+      gs.timeSet = gps.isTimeSet();
+      gps.getGPSStrings(gs.lat, gs.lon, gs.elev);
+      spiDriver.pushGpsStatus(&gs);
+    }
+  }
 
   // Handle ESP32 web server config commands (WiFi mode only)
   if (spiDriver.hasConfigCmd()) {
@@ -1657,6 +1685,30 @@ void loop() {
           case PARAM_SYSLOG_PORT:
             if (valLen == 2) cfg.data.syslogPort = (val[0] << 8) | val[1];
             break;
+          case PARAM_RX_DIGITAL_GAIN_PCT:
+            if (valLen == 1) {
+              cfg.data.radioRxDigitalGainPct = val[0];
+              dsp.setRxDigitalGainPct(val[0]);
+            }
+            break;
+          case PARAM_DNS_SERVER_IP:
+            if (valLen == 4) memcpy(&cfg.data.dnsServerIP, val, 4);
+            break;
+          case PARAM_USE_STATIC_IP:
+            if (valLen == 1) cfg.data.useStaticIP = val[0];
+            break;
+          case PARAM_STATIC_IP:
+            if (valLen == 4) memcpy(&cfg.data.staticIP, val, 4);
+            break;
+          case PARAM_SUBNET_MASK:
+            if (valLen == 4) memcpy(&cfg.data.subnetMask, val, 4);
+            break;
+          case PARAM_GATEWAY:
+            if (valLen == 4) memcpy(&cfg.data.gateway, val, 4);
+            break;
+          case PARAM_STATIC_DNS:
+            if (valLen == 4) memcpy(&cfg.data.staticDNS, val, 4);
+            break;
         }
         Serial.printf("[WebCfg] SET_PARAM id=0x%02X len=%d\r\n", paramId, valLen);
       } else if (subCmd == CFG_CMD_SAVE_REBOOT) {
@@ -1697,7 +1749,6 @@ void loop() {
   if (networkReady) {
     voterClient.update();
   }
-  webServer.handleClient(); // Handle web requests
 
   // Debug Jitter Buffer
   static uint32_t lastJitterDebug = 0;
@@ -1928,16 +1979,7 @@ void loop() {
 
         // Standard -120ms delay offset for modern Ethernet (was -180ms)
         voterClient.setTimingOffset(-120);
-        
-        // Periodic Status Heartbeat (every 5 seconds)
-        static uint32_t lastHb = 0;
-        if (millis() - lastHb > 5000) {
-            lastHb = millis();
-            Serial.printf("[Heartbeat] GPS: %s, Sats: %u, Epoch: %lu\r\n", 
-                          gps.isLocked() ? "LOCKED" : "WAITING", 
-                          gps.getSatellites(), gps.getEpoch());
-        }
-        
+
         VTIME frameTime = {0, 0};
         if (gps.isTimeSet()) {
           gps.getNetworkTime(&frameTime, true);

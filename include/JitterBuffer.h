@@ -46,7 +46,15 @@ private:
   // Jitter Handling
   bool _buffering;     // True if we are filling up, False if playing
   size_t _targetLevel; // Bytes to accumulate before playing (Start Threshold)
-  size_t _underrunThreshold; // Minimum bytes before we trigger re-buffering
+
+  // Diagnostics - isolating whether remaining audio jitter is from real
+  // buffer underruns (network-side gaps) or something further downstream
+  // in playback. Rate-limited summary rather than per-event, since a
+  // partial shortfall can legitimately happen often on a real network.
+  uint32_t _underrunCount;        // avail==0, full re-buffer triggered
+  uint32_t _partialShortfallCount; // toRead < len, silence-padded but no re-buffer
+  uint32_t _lastReportTime;
+  void _reportIfDue();
 };
 
 #endif

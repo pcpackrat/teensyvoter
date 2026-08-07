@@ -54,7 +54,7 @@ void GPSManager::begin(Stream *serialPort, uint8_t ppsPin) {
   _gpsSerial = serialPort;
   _ppsPin = ppsPin;
 
-  pinMode(_ppsPin, INPUT);
+  pinMode(_ppsPin, INPUT_PULLDOWN);
   // Trigger on RISING edge (standard for PPS)
   attachInterrupt(digitalPinToInterrupt(_ppsPin), _ppsISR, RISING);
 }
@@ -86,18 +86,29 @@ void GPSManager::update() {
 
       // Safety check: Update Epoch from NMEA
       time_t gpsTime = makeTime(tm);
-      
+      bool firstSync = !_validTime;
+
       // If we are significantly off, or it's our first sync, hard-set the epoch
-      if (!_validTime || abs((int64_t)gpsTime - (int64_t)_currentEpoch) >= 1) {
-          uint32_t age = _gpsParser.time.age();
-          
+      if (firstSync || abs((int64_t)gpsTime - (int64_t)_currentEpoch) >= 1) {
           noInterrupts();
           _currentEpoch = gpsTime;
           _validTime = true;
-          // Re-align PPS marker to the reported age of this NMEA sentence
-          _lastPpsMicros = micros() - (age * 1000);
           interrupts();
-          
+
+          // Only seed the PPS marker from NMEA on the very first sync, before
+          // any real PPS edge has been seen (bootstrap). If this ran on every
+          // drift correction, it would keep refreshing _lastPpsMicros from
+          // serial timing alone, indefinitely - NMEA keeps flowing even with
+          // PPS physically disconnected, so PPS loss would never be detected
+          // (_getRawLockStatus() only looks at _lastPpsMicros). After the
+          // first sync, _handlePPS() (the real ISR) is the sole owner.
+          if (firstSync) {
+            uint32_t age = _gpsParser.time.age();
+            noInterrupts();
+            _lastPpsMicros = micros() - (age * 1000);
+            interrupts();
+          }
+
           // Sync Teensy RTC
           Teensy3Clock.set(gpsTime);
       }

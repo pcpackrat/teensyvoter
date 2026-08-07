@@ -48,7 +48,7 @@ void Logger::log(LogLevel level, const char* tag, const char* fmt, ...) {
     const char* lvlStr = "INFO";
     if (level == LOG_WARNING) lvlStr = "WARN";
     if (level == LOG_ERR) lvlStr = "ERROR";
-    Serial.printf("[LOG][%s][%s] %s\n", lvlStr, tag, buf);
+    Serial.printf("[LOG][%s][%s] %s\r\n", lvlStr, tag, buf);
 }
 
 void Logger::info(const char* tag, const char* fmt, ...) {

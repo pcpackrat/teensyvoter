@@ -2,9 +2,8 @@
 
 NetworkManager::NetworkManager() { _driver = nullptr; }
 
-void NetworkManager::begin(NetworkDriver *driver, uint8_t *mac_addr) {
+void NetworkManager::begin(NetworkDriver *driver) {
   _driver = driver;
-  _mac = mac_addr;
 
   // Note: Driver is already initialized by caller (main.cpp)
   // Don't call _driver->begin() again here
@@ -58,24 +57,6 @@ bool NetworkManager::isConnected() {
 IPAddress NetworkManager::getLocalIP() {
   if (_driver)
     return _driver->getLocalIP();
-  return IPAddress(0, 0, 0, 0);
-}
-
-IPAddress NetworkManager::getSubnetMask() {
-  if (_driver)
-    return _driver->getSubnetMask();
-  return IPAddress(0, 0, 0, 0);
-}
-
-IPAddress NetworkManager::getGateway() {
-  if (_driver)
-    return _driver->getGateway();
-  return IPAddress(0, 0, 0, 0);
-}
-
-IPAddress NetworkManager::getDNS() {
-  if (_driver)
-    return _driver->getDNS();
   return IPAddress(0, 0, 0, 0);
 }
 

@@ -74,6 +74,7 @@ private:
   int16_t _lastUpsampleVal;
   int16_t _reservoir[32];
   int _reservoirLen;
+  uint32_t _droppedOutputBlocks; // getBuffer()==NULL, AudioMemory pool exhausted mid-upsample
 
   // DC Blocker State
   float _prevIn;

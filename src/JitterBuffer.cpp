@@ -4,6 +4,9 @@ JitterBuffer::JitterBuffer() {
   _head = 0;
   _tail = 0;
   _buffering = true;
+  _underrunCount = 0;
+  _partialShortfallCount = 0;
+  _lastReportTime = 0;
 
   // Default Latency: 200ms
   // 8000 samples/sec * 0.2s = 1600 samples
@@ -18,7 +21,6 @@ void JitterBuffer::setLatency(uint16_t ms) {
 
   // Calculate target bytes
   _targetLevel = (uint32_t)ms * 8;
-  _underrunThreshold = 160; // 1 packet (20ms) leeway
 
   reset();
 }
@@ -71,14 +73,20 @@ size_t JitterBuffer::get(uint8_t *out, size_t len) {
     }
   }
 
-  if (avail < len) {
-    // Partial read or Underrun
-    if (avail <= _underrunThreshold) {
-      // Buffer empty! Enter buffering mode.
-      _buffering = true;
-      memset(out, 0xFF, len);
-      return 0;
-    }
+  if (avail == 0) {
+    // Truly empty - only now re-enter buffering mode. Previously this
+    // fired via _underrunThreshold == len (one packet), so ANY shortfall
+    // below a single full frame - even one packet arriving a few ms late,
+    // which happens constantly on a real network - forced a full 200ms
+    // re-buffer instead of a single ~20ms silence-padded gap. That made
+    // ordinary network jitter sound like constant choppiness. Now only a
+    // fully-drained buffer re-triggers buffering; a partial shortfall just
+    // plays what's real and pads the rest with silence for this one frame.
+    _buffering = true;
+    _underrunCount++;
+    memset(out, 0xFF, len);
+    _reportIfDue();
+    return 0;
   }
 
   // Read data
@@ -91,10 +99,24 @@ size_t JitterBuffer::get(uint8_t *out, size_t len) {
 
   // If we requested more than available, fill rest with silence
   if (toRead < len) {
+    _partialShortfallCount++;
     memset(out + toRead, 0xFF, len - toRead);
   }
 
-  return toRead;
+  _reportIfDue();
+  return len; // out is always fully populated (real data + any silence pad)
+}
+
+void JitterBuffer::_reportIfDue() {
+  uint32_t now = millis();
+  if (now - _lastReportTime < 5000) return;
+  if (_lastReportTime != 0 && (_underrunCount > 0 || _partialShortfallCount > 0)) {
+    Serial.printf("[JitterBuf] underruns(full rebuffer)=%lu partial(padded)=%lu since last report\r\n",
+                  (unsigned long)_underrunCount, (unsigned long)_partialShortfallCount);
+  }
+  _lastReportTime = now;
+  _underrunCount = 0;
+  _partialShortfallCount = 0;
 }
 
 float JitterBuffer::getBufferUsage() {

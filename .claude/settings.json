@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "ask": [
+      "Bash(*teensy_loader_cli*)",
+      "Bash(*upload*)",
+      "Bash(*monitor*)",
+      "PowerShell(*teensy_loader_cli*)",
+      "PowerShell(*upload*)",
+      "PowerShell(*monitor*)"
+    ]
+  }
+}

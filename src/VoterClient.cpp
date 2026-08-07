@@ -65,8 +65,15 @@ VoterClient::VoterClient() {
   _gpsLostTime = 0;
   _authAttempts = 0;
   _lastRxTime = 0;
+  _corruptedPacketCount = 0;
+  _lastCorruptedReportTime = 0;
+  _authMismatchStreak = 0;
+  _droppedAudioDigestMismatch = 0;
+  _lastDroppedAudioReportTime = 0;
+  _audioFramesSent = 0;
   _hasWarnedAuth = false;
   _hasWarnedGps = false;
+  _hasWarnedGpsWaitConnect = false;
   _serverDigest = 0;
   _myDigest = 0;
   memset(_myChallenge, 0, sizeof(_myChallenge));
@@ -79,11 +86,6 @@ VoterClient::VoterClient() {
   _burstPacketCount = 0;
   _gpSeq = 0;
   _lastHostAudioTime = 0;
-  _spiStatsWindowStart = 0;
-  _audioSendCount = 0;
-  _audioSendMaxUs = 0;
-  _audioSendTotalUs = 0;
-  _audioSendOver15msCount = 0;
   _pendingAudioSend = false;
 }
 
@@ -102,9 +104,6 @@ void VoterClient::begin(NetworkManager *net, GPSManager *gps, IPAddress host,
 }
 
 void VoterClient::update() {
-  // Phase 0 SPI measurement: report audio-send throughput/latency every 5s.
-  _reportSpiStats();
-
   // 1. Check Incoming
   int packetSize = _net->parsePacket();
   if (packetSize >= (int)sizeof(VOTER_PACKET_HEADER)) {
@@ -120,8 +119,10 @@ void VoterClient::update() {
       _lastAttemptTime = millis();
       // Only attempt to connect if we have a GPS Lock
       if (_gps && _gps->isLocked()) {
+        _hasWarnedGpsWaitConnect = false;
         _sendAuthPacket();
-      } else {
+      } else if (!_hasWarnedGpsWaitConnect) {
+        _hasWarnedGpsWaitConnect = true;
         Serial.println("[Voter] Waiting for GPS Lock before connecting...");
       }
     }
@@ -308,6 +309,28 @@ void VoterClient::_sendGPSPacket() {
   _net->sendPacket((uint8_t *)&pkt, sizeof(pkt));
 }
 
+bool VoterClient::_isValidChallenge(const char *challenge) {
+  // Challenge is always a decimal number encoded as an ASCII string
+  // (_generateChallenge() builds it via snprintf "%lu"), null-padded to
+  // VOTER_CHALLENGE_LEN. Anything else in that field means the packet
+  // got corrupted in transit - observed on hardware as garbled text
+  // ("New Server Challenge: (garbage)") and repeated failed auth
+  // attempts, intermittently, with no single change it traced back to -
+  // most likely occasional SPI receive corruption. Reject rather than
+  // act on it (recalculating digests from garbage, or printing it).
+  bool sawNull = false;
+  for (int i = 0; i < VOTER_CHALLENGE_LEN; i++) {
+    char c = challenge[i];
+    if (c == '\0') {
+      sawNull = true;
+      continue;
+    }
+    if (sawNull) return false; // non-null byte after padding started
+    if (c < '0' || c > '9') return false;
+  }
+  return true;
+}
+
 void VoterClient::_handlePacket(const uint8_t *data, int len) {
   VOTER_PACKET_HEADER *header = (VOTER_PACKET_HEADER *)data;
 
@@ -328,7 +351,29 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
 
   // Debug info
 
-  bool newChallenge =
+  // Only treat this as a genuine new-challenge/session-reset event if the
+  // challenge both differs from our current one AND looks like a real
+  // challenge (digits, null-padded) - a single corrupted header byte
+  // shouldn't be able to force a full re-auth cycle. This does NOT gate
+  // digest verification or audio dispatch below - a glitched challenge
+  // byte doesn't mean the rest of the packet (digest, audio payload) is
+  // also bad, and the digest check already protects that path on its
+  // own. An earlier version of this fix dropped the whole packet on a
+  // bad challenge and made things much worse: audio packets carry this
+  // same header field at 50pps, so even a modest per-packet corruption
+  // rate on it was discarding a lot of otherwise-good audio frames
+  // wholesale.
+  bool challengeValid = _isValidChallenge(rcvChallenge);
+  if (!challengeValid) {
+    _corruptedPacketCount++;
+    if (millis() - _lastCorruptedReportTime > 10000) {
+      _lastCorruptedReportTime = millis();
+      Serial.printf("[Voter] %lu corrupted challenge field(s) so far (packet still processed)\r\n",
+                    (unsigned long)_corruptedPacketCount);
+    }
+  }
+
+  bool newChallenge = challengeValid &&
       (strncmp(rcvChallenge, _serverChallenge, VOTER_CHALLENGE_LEN) != 0);
   uint16_t type = my_ntohs(header->payload_type);
 
@@ -355,6 +400,7 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
   // Verify Server Digest
   uint32_t incomingDigest = my_ntohl(header->digest);
   if (incomingDigest == _serverDigest) {
+    _authMismatchStreak = 0; // A good digest clears any prior bad reads
     _hasWarnedAuth = false; // Reset warning state on happy path
 
     if (_state == VOTER_DISCONNECTED) {
@@ -389,9 +435,16 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
     }
   } else {
     // If Digest Mismatch AND it was an AUTH packet, it might be a challenge we
-    // missed or a retry
+    // missed or a retry - or, confirmed on hardware, a single corrupted SPI
+    // read (e.g. digest field landing as 0xFFC00000 right as audio traffic
+    // starts) that has nothing to do with the actual passwords. A real
+    // password mismatch fails every single retry; a one-off bit error
+    // clears on the next packet. Require several in a row before treating
+    // it as terminal, same reasoning already applied to the challenge field
+    // above - one bad packet shouldn't tear down the whole session.
     if (type == PAYLOAD_AUTH) {
-      if (!_hasWarnedAuth) {
+      _authMismatchStreak++;
+      if (_authMismatchStreak >= 3 && !_hasWarnedAuth) {
         _hasWarnedAuth = true;
         _state = VOTER_AUTH_ERROR; // Stop retrying!
         _authError = AUTH_ERR_HOST_MISMATCH;
@@ -402,6 +455,21 @@ void VoterClient::_handlePacket(const uint8_t *data, int len) {
             "check your Voter and Host passwords.");
       }
       // This prevents a rapid-fire feedback loop between client and server.
+    } else if (type == PAYLOAD_ULAW) {
+      // A digest mismatch on an audio packet silently drops that whole
+      // 20ms frame (never reaches _handleProxyAudioPacket()) - previously
+      // invisible. Counting/reporting this separately from the AUTH-packet
+      // case above so we can tell whether ongoing SPI-level corruption is
+      // eating audio frames one at a time, which would sound like exactly
+      // this kind of steady jitter even with the auth-cascade bug fixed.
+      _droppedAudioDigestMismatch++;
+      if (millis() - _lastDroppedAudioReportTime > 10000) {
+        _lastDroppedAudioReportTime = millis();
+        Serial.printf(
+            "[Voter] %lu audio frame(s) dropped so far on digest mismatch "
+            "(Exp: 0x%08X Got: 0x%08X)\r\n",
+            (unsigned long)_droppedAudioDigestMismatch, _serverDigest, incomingDigest);
+      }
     }
   }
 }
@@ -501,37 +569,18 @@ void VoterClient::flushPendingAudio() {
   if (!_pendingAudioSend) return;
   _pendingAudioSend = false;
 
-  uint32_t sendStart = micros();
   _net->sendPacket((uint8_t *)&_pendingAudioPkt, sizeof(_pendingAudioPkt));
-  uint32_t sendUs = micros() - sendStart;
 
-  _audioSendCount++;
-  _audioSendTotalUs += sendUs;
-  if (sendUs > _audioSendMaxUs) _audioSendMaxUs = sendUs;
-  if (sendUs > 15000) _audioSendOver15msCount++;
-}
-
-void VoterClient::_reportSpiStats() {
-  uint32_t now = millis();
-  if (_spiStatsWindowStart == 0) {
-    _spiStatsWindowStart = now;
-    return;
+  // Per-window count (resets each print), same style as the ESP32's own
+  // "UDPfwd" heartbeat counter - line these two logs up side by side
+  // during a choppy test. If this number and the ESP32's diverge, that
+  // pinpoints whether frames are going missing on the Teensy->ESP32 SPI
+  // leg or the ESP32->server UDP leg.
+  _audioFramesSent++;
+  static uint32_t lastAudioSentReport = 0;
+  if (millis() - lastAudioSentReport > 5000) {
+    lastAudioSentReport = millis();
+    Serial.printf("[SPI-TX] Audio frames sent (last ~5s window): %lu\r\n", (unsigned long)_audioFramesSent);
+    _audioFramesSent = 0;
   }
-  if (now - _spiStatsWindowStart < 5000) return;
-
-  uint32_t windowMs = now - _spiStatsWindowStart;
-  float avgUs = _audioSendCount ? (float)_audioSendTotalUs / _audioSendCount : 0;
-  float achievedPps = _audioSendCount * 1000.0f / windowMs;
-
-  Serial.printf(
-      "[SPI-STATS] window=%lums sends=%lu avgPps=%.1f avgLatencyUs=%.0f "
-      "maxLatencyUs=%lu over15ms=%lu\r\n",
-      windowMs, _audioSendCount, achievedPps, avgUs, _audioSendMaxUs,
-      _audioSendOver15msCount);
-
-  _spiStatsWindowStart = now;
-  _audioSendCount = 0;
-  _audioSendMaxUs = 0;
-  _audioSendTotalUs = 0;
-  _audioSendOver15msCount = 0;
 }

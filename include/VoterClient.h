@@ -85,6 +85,7 @@ private:
   uint32_t _crc32(const uint8_t *buf1, const uint8_t *buf2);
   void _sendAuthPacket();
   void _handlePacket(const uint8_t *data, int len);
+  bool _isValidChallenge(const char *challenge);
   void _handleProxyAudioPacket(const uint8_t *data, int len);
   void _generateChallenge();
   void _sendGPSPacket();
@@ -92,8 +93,15 @@ private:
   uint32_t _gpsLostTime;
   uint32_t _authAttempts;
   uint32_t _lastRxTime;
+  uint32_t _corruptedPacketCount;
+  uint32_t _lastCorruptedReportTime;
+  uint8_t _authMismatchStreak;
+  uint32_t _droppedAudioDigestMismatch;
+  uint32_t _lastDroppedAudioReportTime;
+  uint32_t _audioFramesSent;
   bool _hasWarnedAuth;
   bool _hasWarnedGps;
+  bool _hasWarnedGpsWaitConnect; // "Waiting for GPS Lock before connecting..." - print once, not every retry
 
   // Protocol Sequencing
   uint32_t _packetCounter; // Free-running 20ms counter
@@ -111,15 +119,6 @@ private:
   bool _anchorActive;
   uint32_t _gpSeq;              // GP Sequence (+1 per non-audio packet)
   uint32_t _lastHostAudioTime; // Timestamp of last audio packet from server
-
-  // Phase 0: SPI send instrumentation (audio path only - this is the
-  // time-critical 20ms-cadence send). Logged/reset every 5s by _reportSpiStats().
-  uint32_t _spiStatsWindowStart;
-  uint32_t _audioSendCount;
-  uint32_t _audioSendMaxUs;
-  uint64_t _audioSendTotalUs;
-  uint32_t _audioSendOver15msCount;
-  void _reportSpiStats();
 
   // Deferred audio send staging - see flushPendingAudio().
   PROXY_AUDIO_PACKET _pendingAudioPkt;

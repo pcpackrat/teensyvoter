@@ -2,14 +2,14 @@
 #define CONFIG_MANAGER_H
 
 #include <Arduino.h>
+#include <IPAddress.h>
 #ifndef ESP32
 #include <EEPROM.h>
-#include <NativeEthernet.h>
 #endif
 
 // Magic Header to detect valid config
 #define CONFIG_MAGIC 0x564F5452 // "VOTR"
-#define CONFIG_VERSION 24       // Added Syslog Hostname Support
+#define CONFIG_VERSION 25       // Removed unused mac[6] (ESP32/WT32-ETH01 owns the only network interface and its own hardware MAC now)
 
 // COS/Squelch Modes
 #define COS_MODE_ALWAYS_ON 0 // Always send RSSI (testing/no squelch)
@@ -39,7 +39,6 @@ struct SysConfig {
   uint16_t syslogPort;
 
   // 8-bit / bool fields
-  uint8_t mac[6];
   uint8_t cosMode;
   uint8_t dspSquelchThresh;
   uint8_t radioRxAnalogGain;

@@ -12,7 +12,8 @@ DSPProcessor::DSPProcessor() {
   _lastUpsampleVal = 0;
   _reservoirLen = 0;
   memset(_reservoir, 0, sizeof(_reservoir));
-  _rxDigitalGain = 1.0f; 
+  _droppedOutputBlocks = 0;
+  _rxDigitalGain = 1.0f;
 }
 
 void DSPProcessor::begin() {
@@ -302,6 +303,23 @@ void DSPProcessor::upsampleAndPlay(int16_t *input, int count,
     // Get Output Buffer
     int16_t *out = queue.getBuffer();
     if (out == NULL) {
+      // Audio library's memory pool is exhausted right now - this whole
+      // 128-sample block (~2.9ms) is silently skipped, not queued, not
+      // retried. A single call here can legitimately produce 6-7 blocks
+      // (160 input samples at 8kHz upsampled to ~882 output samples at
+      // 44.1kHz), so if the pool is already fairly full when a call
+      // starts, running out partway through is real and would sound
+      // exactly like the jitter this is chasing - invisible to every
+      // upstream counter (SPI, jitter buffer) since it's entirely local
+      // to this playback pipeline. Counting to confirm/deny.
+      _droppedOutputBlocks++;
+      static uint32_t lastDropReport = 0;
+      uint32_t now = millis();
+      if (now - lastDropReport > 5000) {
+        lastDropReport = now;
+        Serial.printf("[DSP] Dropped %lu output block(s) so far (AudioMemory pool exhausted mid-upsample)\r\n",
+                      (unsigned long)_droppedOutputBlocks);
+      }
       _upsamplePhase += (double)BLOCK_SIZE * step;
       continue;
     }
@@ -342,7 +360,15 @@ void DSPProcessor::upsampleAndPlay(int16_t *input, int count,
   int consumed = (int)_upsamplePhase;
   int remaining = totalLen - consumed;
 
-  if (remaining > 0 && remaining < 100) {
+  // Bound must match _reservoir's actual declared size (int16_t[32] in
+  // DSPProcessor.h) - this previously allowed up to 99, a real
+  // out-of-bounds write into adjacent class members whenever the resample
+  // loop exited early (e.g. queue.getBuffer() returning NULL on its first
+  // iteration) and left a large unconsumed tail. Normal steady-state
+  // remaining is ~23-24 samples (about one block's worth of input), well
+  // under 32, so this only ever fired under exactly the abnormal
+  // condition most likely to also be causing audible glitches.
+  if (remaining > 0 && remaining <= (int)(sizeof(_reservoir) / sizeof(_reservoir[0]))) {
     memcpy(_reservoir, workBuf + consumed, remaining * sizeof(int16_t));
     _reservoirLen = remaining;
     _upsamplePhase -= (double)consumed;

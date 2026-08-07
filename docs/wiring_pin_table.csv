@@ -5,14 +5,17 @@ GPS TX,GPS GT-UT,TX,GPS -> Teensy,RX1 (pin 0),GPS -> Teensy Serial1 RX
 GPS RX,GPS GT-UT,RX,GPS -> Teensy,TX1 (pin 1),Optional (only if configuring GPS)
 GPS PPS,GPS GT-UT,PPS,GPS -> Teensy,D2 (pin 2),Attach to `PPS_PIN`
 GPS VCC,GPS GT-UT,VCC,Power,3.3V or module-specified,Vcc must be compatible; use level shifting if 5V
-ESP32 MISO,ESP32 WROOM,MISO (D19),ESP32 -> Teensy,MISO (pin 12),Hardware SPI MISO
-ESP32 MOSI,ESP32 WROOM,MOSI (D23),ESP32 -> Teensy,MOSI (pin 11),Hardware SPI MOSI
-ESP32 SCK,ESP32 WROOM,SCK (D18),ESP32 -> Teensy,SCK (pin 13),Hardware SPI SCK
-ESP32 CS,ESP32 WROOM,CS (D5),ESP32 -> Teensy,D26 (pin 26),Chip select (Moved to 26 to free 10 for SD)
-ESP32 READY,ESP32 WROOM,READY (D22),ESP32 -> Teensy,D24 (pin 24),Module ready/interrupt line
-ESP32 RESET,Teensy,EN,ESP32 -> RESET (EN),D25 (pin 25),Teensy drives ESP reset
-ESP32 VCC,ESP32 WROOM,VCC,Power,3.3V regulator output,Use dedicated 3.3V regulator >=800mA
-ESP32 GND,ESP32 WROOM,GND,Power,GND,Common ground
+ESP32 MISO,WT32-ETH01,MISO (IO15),ESP32 -> Teensy,MISO (pin 12),Hardware SPI MISO (moved off WROOM's IO19 - reserved by LAN8720 on ETH01)
+ESP32 MOSI,WT32-ETH01,MOSI (IO14),ESP32 -> Teensy,MOSI (pin 11),Hardware SPI MOSI (moved off WROOM's IO23 - reserved by LAN8720 on ETH01)
+ESP32 SCK,WT32-ETH01,SCK (IO12),ESP32 -> Teensy,SCK (pin 13),Hardware SPI SCK (moved off WROOM's IO18 - reserved by LAN8720 on ETH01)
+ESP32 CS,WT32-ETH01,CS (IO35),ESP32 -> Teensy,D26 (pin 26),Chip select (moved off WROOM's IO5; this board doesn't break out IO32/33, forced onto input-only IO35 - bench-verify SPI-slave hardware CS works here; IO36/IO39 are spares to try if not)
+ESP32 READY,WT32-ETH01,READY (IO4),ESP32 -> Teensy,D24 (pin 24),Module ready/interrupt line (moved off WROOM's IO22; only free bidirectional GPIO left on this board's header)
+ESP32 RESET,Teensy,EN,ESP32 -> RESET (EN),D25 (pin 25),Teensy drives ESP reset; passthrough flashing also pulses this line to enter/exit the ROM bootloader
+ESP32 GPIO0,Teensy,D27,ESP32 -> GPIO0,IO0,Passthrough flashing only: Teensy holds LOW during EN pulse to force ROM bootloader entry; released (floating/HIGH) for normal boot - also the ETH clock input, do not drive during normal Ethernet operation
+ESP32 UART0 TX,Teensy,TX8 (pin 35),ESP32 -> RXO,IO3,Passthrough flashing only: Teensy Serial8 TX -> ESP32 UART0 RX (esptool traffic)
+ESP32 UART0 RX,Teensy,RX8 (pin 34),ESP32 -> TXO,IO1,Passthrough flashing only: Teensy Serial8 RX <- ESP32 UART0 TX (esptool traffic)
+ESP32 VCC,WT32-ETH01,5V,Power,5V input,ETH01 has onboard 3.3V regulator - feed its 5V pin, not 3.3V
+ESP32 GND,WT32-ETH01,GND,Power,GND,Common ground
 Audio Shield,Teensy 4.1,Header,Audio Shield,Header,Audio Shield Rev D plugs directly onto Teensy headers
 RSSI out,External RSSI Divider,OUT,RSSI -> Teensy,38 (A14),Max 3.3V
 I2C SDA,Audio Shield/SGTL5000,SDA,Teensy,SDA (on I2C pins),Used by SGTL5000 control (if breakout used)

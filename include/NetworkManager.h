@@ -3,22 +3,18 @@
 
 #include "NetworkDriver.h"
 #include <Arduino.h>
-// #include "EspSpiDriver.h" // We'll include concrete types in main
 
 class NetworkManager {
 public:
   NetworkManager();
 
   // Init
-  void begin(NetworkDriver *driver, uint8_t *mac_addr);
+  void begin(NetworkDriver *driver);
 
   // Passthrough
   void update();
   bool isConnected();
   IPAddress getLocalIP();
-  IPAddress getSubnetMask();
-  IPAddress getGateway();
-  IPAddress getDNS();
   DriverType getType();
 
   void setYieldCallback(void (*cb)()) { if(_driver) _driver->setYieldCallback(cb); }
@@ -34,7 +30,6 @@ public:
 
 private:
   NetworkDriver *_driver;
-  uint8_t *_mac;
 };
 
 #endif
